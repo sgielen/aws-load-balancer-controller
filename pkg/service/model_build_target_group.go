@@ -362,6 +362,13 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingSpec(ctx context.Context,
 	if err != nil {
 		return elbv2model.TargetGroupBindingResourceSpec{}, err
 	}
+	// buildTargetGroupBindingNetwork() will try to find the target Pod networking information,
+	// in order to adjust the node security group to allow connections from the new load balancer
+	// towards the target Pods. However, this is only supported on the native AWS CNI, which we
+	// don't use, so it will fail.
+	// In our case, we don't need to ajust the node security group, so we skip this step altogether
+	// and supply a nil networking requirement.
+	/*
 	targetPort := port.TargetPort
 	targetType := elbv2api.TargetType(targetGroup.Spec.TargetType)
 	if targetType == elbv2api.TargetTypeInstance {
@@ -375,6 +382,9 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingSpec(ctx context.Context,
 		}
 	}
 	tgbNetworking := t.buildTargetGroupBindingNetworking(ctx, targetPort, preserveClientIP, *hc.Port, port.Protocol, defaultSourceRanges)
+	*/
+	targetType := elbv2api.TargetType(targetGroup.Spec.TargetType)
+	var tgbNetworking *elbv2model.TargetGroupBindingNetworking
 	return elbv2model.TargetGroupBindingResourceSpec{
 		Template: elbv2model.TargetGroupBindingTemplate{
 			ObjectMeta: metav1.ObjectMeta{
