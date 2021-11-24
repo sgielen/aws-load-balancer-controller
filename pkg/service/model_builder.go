@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"strconv"
+	"sync"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +23,7 @@ const (
 	LoadBalancerTypeExternal       = "external"
 	LoadBalancerTargetTypeIP       = "ip"
 	LoadBalancerTargetTypeInstance = "instance"
+	lbAttrsDeletionProtection      = "deletion_protection.enabled"
 )
 
 // ModelBuilder builds the model stack for the service resource.
@@ -122,6 +125,9 @@ type defaultModelBuildTask struct {
 	tgByResID    map[string]*elbv2model.TargetGroup
 	ec2Subnets   []*ec2.Subnet
 
+	fetchExistingLoadBalancerOnce sync.Once
+	existingLoadBalancer          *elbv2deploy.LoadBalancerWithTags
+
 	defaultTags                          map[string]string
 	externalManagedTags                  sets.String
 	defaultSSLPolicy                     string
@@ -138,6 +144,7 @@ type defaultModelBuildTask struct {
 	defaultHealthCheckTimeout            int64
 	defaultHealthCheckHealthyThreshold   int64
 	defaultHealthCheckUnhealthyThreshold int64
+	defaultDeletionProtectionEnabled     bool
 
 	// Default health check settings for NLB instance mode with spec.ExternalTrafficPolicy set to Local
 	defaultHealthCheckProtocolForInstanceModeLocal           elbv2model.Protocol
@@ -151,6 +158,13 @@ type defaultModelBuildTask struct {
 
 func (t *defaultModelBuildTask) run(ctx context.Context) error {
 	if !t.service.DeletionTimestamp.IsZero() {
+		deletionProtectionEnabled, err := t.getDeletionProtectionViaAnnotation(*t.service)
+		if err != nil {
+			return err
+		}
+		if deletionProtectionEnabled {
+			return errors.Errorf("deletion_protection is enabled, cannot delete the service: %v", t.service.Name)
+		}
 		return nil
 	}
 	err := t.buildModel(ctx)
@@ -158,17 +172,11 @@ func (t *defaultModelBuildTask) run(ctx context.Context) error {
 }
 
 func (t *defaultModelBuildTask) buildModel(ctx context.Context) error {
-	scheme, explicitScheme, err := t.buildLoadBalancerScheme(ctx)
+	scheme, err := t.buildLoadBalancerScheme(ctx)
 	if err != nil {
 		return err
 	}
-	if !explicitScheme && len(t.service.Status.LoadBalancer.Ingress) != 0 {
-		scheme, err = t.getExistingLoadBalancerScheme(ctx)
-		if err != nil {
-			return err
-		}
-	}
-	t.ec2Subnets, err = t.resolveLoadBalancerSubnets(ctx, scheme)
+	t.ec2Subnets, err = t.buildLoadBalancerSubnets(ctx, scheme)
 	if err != nil {
 		return err
 	}
@@ -181,4 +189,20 @@ func (t *defaultModelBuildTask) buildModel(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (t *defaultModelBuildTask) getDeletionProtectionViaAnnotation(svc corev1.Service) (bool, error) {
+	var lbAttributes map[string]string
+	_, err := t.annotationParser.ParseStringMapAnnotation(annotations.SvcLBSuffixLoadBalancerAttributes, &lbAttributes, svc.Annotations)
+	if err != nil {
+		return false, err
+	}
+	if _, deletionProtectionSpecified := lbAttributes[lbAttrsDeletionProtection]; deletionProtectionSpecified {
+		deletionProtectionEnabled, err := strconv.ParseBool(lbAttributes[lbAttrsDeletionProtection])
+		if err != nil {
+			return false, err
+		}
+		return deletionProtectionEnabled, nil
+	}
+	return false, nil
 }

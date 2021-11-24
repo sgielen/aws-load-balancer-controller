@@ -7,13 +7,17 @@ import (
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1beta1"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
+	elbv2api "sigs.k8s.io/aws-load-balancer-controller/apis/elbv2/v1beta1"
 	"sigs.k8s.io/aws-load-balancer-controller/controllers/ingress/eventhandlers"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/config"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy"
+	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/ingress"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
@@ -30,24 +34,30 @@ import (
 const (
 	ingressTagPrefix = "ingress.k8s.aws"
 	controllerName   = "ingress"
+
+	// the groupVersion of used Ingress & IngressClass resource.
+	ingressResourcesGroupVersion = "networking.k8s.io/v1beta1"
+	ingressClassKind             = "IngressClass"
 )
 
 // NewGroupReconciler constructs new GroupReconciler
 func NewGroupReconciler(cloud aws.Cloud, k8sClient client.Client, eventRecorder record.EventRecorder,
 	finalizerManager k8s.FinalizerManager, networkingSGManager networkingpkg.SecurityGroupManager,
 	networkingSGReconciler networkingpkg.SecurityGroupReconciler, subnetsResolver networkingpkg.SubnetsResolver,
-	config config.ControllerConfig, logger logr.Logger) *groupReconciler {
+	config config.ControllerConfig, backendSGProvider networkingpkg.BackendSGProvider, logger logr.Logger) *groupReconciler {
 
 	annotationParser := annotations.NewSuffixAnnotationParser(annotations.AnnotationPrefixIngress)
 	authConfigBuilder := ingress.NewDefaultAuthConfigBuilder(annotationParser)
 	enhancedBackendBuilder := ingress.NewDefaultEnhancedBackendBuilder(k8sClient, annotationParser, authConfigBuilder)
 	referenceIndexer := ingress.NewDefaultReferenceIndexer(enhancedBackendBuilder, authConfigBuilder, logger)
+	trackingProvider := tracking.NewDefaultProvider(ingressTagPrefix, config.ClusterName)
+	elbv2TaggingManager := elbv2deploy.NewDefaultTaggingManager(cloud.ELBV2(), cloud.VpcID(), config.FeatureGate, logger)
 	modelBuilder := ingress.NewDefaultModelBuilder(k8sClient, eventRecorder,
 		cloud.EC2(), cloud.ACM(),
 		annotationParser, subnetsResolver,
-		authConfigBuilder, enhancedBackendBuilder,
+		authConfigBuilder, enhancedBackendBuilder, trackingProvider, elbv2TaggingManager,
 		cloud.VpcID(), config.ClusterName, config.DefaultTags, config.ExternalManagedTags,
-		config.DefaultSSLPolicy, logger)
+		config.DefaultSSLPolicy, backendSGProvider, config.EnableBackendSecurityGroup, config.DisableRestrictedSGRules, logger)
 	stackMarshaller := deploy.NewDefaultStackMarshaller()
 	stackDeployer := deploy.NewDefaultStackDeployer(cloud, k8sClient, networkingSGManager, networkingSGReconciler,
 		config, ingressTagPrefix, logger)
@@ -58,12 +68,13 @@ func NewGroupReconciler(cloud aws.Cloud, k8sClient client.Client, eventRecorder 
 	groupFinalizerManager := ingress.NewDefaultFinalizerManager(finalizerManager)
 
 	return &groupReconciler{
-		k8sClient:        k8sClient,
-		eventRecorder:    eventRecorder,
-		referenceIndexer: referenceIndexer,
-		modelBuilder:     modelBuilder,
-		stackMarshaller:  stackMarshaller,
-		stackDeployer:    stackDeployer,
+		k8sClient:         k8sClient,
+		eventRecorder:     eventRecorder,
+		referenceIndexer:  referenceIndexer,
+		modelBuilder:      modelBuilder,
+		stackMarshaller:   stackMarshaller,
+		stackDeployer:     stackDeployer,
+		backendSGProvider: backendSGProvider,
 
 		groupLoader:           groupLoader,
 		groupFinalizerManager: groupFinalizerManager,
@@ -75,12 +86,13 @@ func NewGroupReconciler(cloud aws.Cloud, k8sClient client.Client, eventRecorder 
 
 // GroupReconciler reconciles a IngressGroup
 type groupReconciler struct {
-	k8sClient        client.Client
-	eventRecorder    record.EventRecorder
-	referenceIndexer ingress.ReferenceIndexer
-	modelBuilder     ingress.ModelBuilder
-	stackMarshaller  deploy.StackMarshaller
-	stackDeployer    deploy.StackDeployer
+	k8sClient         client.Client
+	eventRecorder     record.EventRecorder
+	referenceIndexer  ingress.ReferenceIndexer
+	modelBuilder      ingress.ModelBuilder
+	stackMarshaller   deploy.StackMarshaller
+	stackDeployer     deploy.StackDeployer
+	backendSGProvider networkingpkg.BackendSGProvider
 
 	groupLoader           ingress.GroupLoader
 	groupFinalizerManager ingress.FinalizerManager
@@ -99,13 +111,11 @@ type groupReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// Reconcile
-func (r *groupReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	return runtime.HandleReconcileError(r.reconcile(req), r.logger)
+func (r *groupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return runtime.HandleReconcileError(r.reconcile(ctx, req), r.logger)
 }
 
-func (r *groupReconciler) reconcile(req ctrl.Request) error {
-	ctx := context.Background()
+func (r *groupReconciler) reconcile(ctx context.Context, req ctrl.Request) error {
 	ingGroupID := ingress.DecodeGroupIDFromReconcileRequest(req)
 	ingGroup, err := r.groupLoader.Load(ctx, ingGroupID)
 	if err != nil {
@@ -116,7 +126,6 @@ func (r *groupReconciler) reconcile(req ctrl.Request) error {
 		r.recordIngressGroupEvent(ctx, ingGroup, corev1.EventTypeWarning, k8s.IngressEventReasonFailedAddFinalizer, fmt.Sprintf("Failed add finalizer due to %v", err))
 		return err
 	}
-
 	_, lb, err := r.buildAndDeployModel(ctx, ingGroup)
 	if err != nil {
 		return err
@@ -129,6 +138,12 @@ func (r *groupReconciler) reconcile(req ctrl.Request) error {
 		}
 		if err := r.updateIngressGroupStatus(ctx, ingGroup, lbDNS); err != nil {
 			r.recordIngressGroupEvent(ctx, ingGroup, corev1.EventTypeWarning, k8s.IngressEventReasonFailedUpdateStatus, fmt.Sprintf("Failed update status due to %v", err))
+			return err
+		}
+	}
+
+	if len(ingGroup.Members) == 0 {
+		if err := r.backendSGProvider.Release(ctx); err != nil {
 			return err
 		}
 	}
@@ -197,7 +212,7 @@ func (r *groupReconciler) updateIngressStatus(ctx context.Context, lbDNS string,
 	return nil
 }
 
-func (r *groupReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+func (r *groupReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, clientSet *kubernetes.Clientset) error {
 	c, err := controller.New(controllerName, mgr, controller.Options{
 		MaxConcurrentReconciles: r.maxConcurrentReconciles,
 		Reconciler:              r,
@@ -205,41 +220,63 @@ func (r *groupReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager
 	if err != nil {
 		return err
 	}
-	if err := r.setupIndexes(ctx, mgr.GetFieldIndexer()); err != nil {
+
+	resList, err := clientSet.ServerResourcesForGroupVersion(ingressResourcesGroupVersion)
+	if err != nil {
 		return err
 	}
-	if err := r.setupWatches(ctx, c); err != nil {
+	ingressClassResourceAvailable := isResourceKindAvailable(resList, ingressClassKind)
+	if err := r.setupIndexes(ctx, mgr.GetFieldIndexer(), ingressClassResourceAvailable); err != nil {
+		return err
+	}
+	if err := r.setupWatches(ctx, c, ingressClassResourceAvailable); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (r *groupReconciler) setupIndexes(ctx context.Context, fieldIndexer client.FieldIndexer) error {
+func (r *groupReconciler) setupIndexes(ctx context.Context, fieldIndexer client.FieldIndexer, ingressClassResourceAvailable bool) error {
 	if err := fieldIndexer.IndexField(ctx, &networking.Ingress{}, ingress.IndexKeyServiceRefName,
-		func(obj k8sruntime.Object) []string {
+		func(obj client.Object) []string {
 			return r.referenceIndexer.BuildServiceRefIndexes(context.Background(), obj.(*networking.Ingress))
 		},
 	); err != nil {
 		return err
 	}
 	if err := fieldIndexer.IndexField(ctx, &networking.Ingress{}, ingress.IndexKeySecretRefName,
-		func(obj k8sruntime.Object) []string {
+		func(obj client.Object) []string {
 			return r.referenceIndexer.BuildSecretRefIndexes(context.Background(), obj.(*networking.Ingress))
 		},
 	); err != nil {
 		return err
 	}
 	if err := fieldIndexer.IndexField(ctx, &corev1.Service{}, ingress.IndexKeySecretRefName,
-		func(obj k8sruntime.Object) []string {
+		func(obj client.Object) []string {
 			return r.referenceIndexer.BuildSecretRefIndexes(context.Background(), obj.(*corev1.Service))
 		},
 	); err != nil {
 		return err
 	}
+	if ingressClassResourceAvailable {
+		if err := fieldIndexer.IndexField(ctx, &networking.IngressClass{}, ingress.IndexKeyIngressClassParamsRefName,
+			func(obj client.Object) []string {
+				return r.referenceIndexer.BuildIngressClassParamsRefIndexes(ctx, obj.(*networking.IngressClass))
+			},
+		); err != nil {
+			return err
+		}
+		if err := fieldIndexer.IndexField(ctx, &networking.Ingress{}, ingress.IndexKeyIngressClassRefName,
+			func(obj client.Object) []string {
+				return r.referenceIndexer.BuildIngressClassRefIndexes(ctx, obj.(*networking.Ingress))
+			},
+		); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (r *groupReconciler) setupWatches(_ context.Context, c controller.Controller) error {
+func (r *groupReconciler) setupWatches(_ context.Context, c controller.Controller, ingressClassResourceAvailable bool) error {
 	ingEventChan := make(chan event.GenericEvent)
 	svcEventChan := make(chan event.GenericEvent)
 	ingEventHandler := eventhandlers.NewEnqueueRequestsForIngressEvent(r.groupLoader, r.eventRecorder,
@@ -248,7 +285,6 @@ func (r *groupReconciler) setupWatches(_ context.Context, c controller.Controlle
 		r.logger.WithName("eventHandlers").WithName("service"))
 	secretEventHandler := eventhandlers.NewEnqueueRequestsForSecretEvent(ingEventChan, svcEventChan, r.k8sClient, r.eventRecorder,
 		r.logger.WithName("eventHandlers").WithName("secret"))
-
 	if err := c.Watch(&source.Channel{Source: ingEventChan}, ingEventHandler); err != nil {
 		return err
 	}
@@ -264,5 +300,32 @@ func (r *groupReconciler) setupWatches(_ context.Context, c controller.Controlle
 	if err := c.Watch(&source.Kind{Type: &corev1.Secret{}}, secretEventHandler); err != nil {
 		return err
 	}
+
+	if ingressClassResourceAvailable {
+		ingClassEventChan := make(chan event.GenericEvent)
+		ingClassParamsEventHandler := eventhandlers.NewEnqueueRequestsForIngressClassParamsEvent(ingClassEventChan, r.k8sClient, r.eventRecorder,
+			r.logger.WithName("eventHandlers").WithName("ingressClassParams"))
+		ingClassEventHandler := eventhandlers.NewEnqueueRequestsForIngressClassEvent(ingEventChan, r.k8sClient, r.eventRecorder,
+			r.logger.WithName("eventHandlers").WithName("ingressClass"))
+		if err := c.Watch(&source.Channel{Source: ingClassEventChan}, ingClassEventHandler); err != nil {
+			return err
+		}
+		if err := c.Watch(&source.Kind{Type: &elbv2api.IngressClassParams{}}, ingClassParamsEventHandler); err != nil {
+			return err
+		}
+		if err := c.Watch(&source.Kind{Type: &networking.IngressClass{}}, ingClassEventHandler); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// isResourceKindAvailable checks whether specific kind is available.
+func isResourceKindAvailable(resList *metav1.APIResourceList, kind string) bool {
+	for _, res := range resList.APIResources {
+		if res.Kind == kind {
+			return true
+		}
+	}
+	return false
 }

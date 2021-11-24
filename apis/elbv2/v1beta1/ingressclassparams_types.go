@@ -56,6 +56,15 @@ type Tag struct {
 	Value string `json:"value"`
 }
 
+// Attributes defines custom attributes on resources.
+type Attribute struct {
+	// The key of the attribute.
+	Key string `json:"key"`
+
+	// The value of the attribute.
+	Value string `json:"value"`
+}
+
 // IngressClassParamsSpec defines the desired state of IngressClassParams
 type IngressClassParamsSpec struct {
 	// NamespaceSelector restrict the namespaces of Ingresses that are allowed to specify the IngressClass with this IngressClassParams.
@@ -77,11 +86,19 @@ type IngressClassParamsSpec struct {
 
 	// Tags defines list of Tags on AWS resources provisioned for Ingresses that belong to IngressClass with this IngressClassParams.
 	Tags []Tag `json:"tags,omitempty"`
+
+	// LoadBalancerAttributes define the custom attributes to LoadBalancers for all Ingress that that belong to IngressClass with this IngressClassParams.
+	// +optional
+	LoadBalancerAttributes []Attribute `json:"loadBalancerAttributes,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:storageversion
+// +kubebuilder:printcolumn:name="GROUP-NAME",type="string",JSONPath=".spec.group.name",description="The Ingress Group name"
+// +kubebuilder:printcolumn:name="SCHEME",type="string",JSONPath=".spec.scheme",description="The AWS Load Balancer scheme"
+// +kubebuilder:printcolumn:name="IP-ADDRESS-TYPE",type="string",JSONPath=".spec.ipAddressType",description="The AWS Load Balancer ipAddressType"
+// +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 // IngressClassParams is the Schema for the IngressClassParams API
 type IngressClassParams struct {
 	metav1.TypeMeta   `json:",inline"`

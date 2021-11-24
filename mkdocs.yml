@@ -1,10 +1,11 @@
-site_name: AWS LoadBalancer Controller
-repo_name: kubernetes-sigs/aws-alb-ingress-controller
-repo_url: https://github.com/kubernetes-sigs/aws-alb-ingress-controller
+site_name: AWS Load Balancer Controller
+repo_name: kubernetes-sigs/aws-load-balancer-controller
+repo_url: https://github.com/kubernetes-sigs/aws-load-balancer-controller
+edit_uri: edit/main/docs/
 strict: true
 
 nav:
-  - Home: 
+  - Home:
     - Welcome: index.md
     - How it works: how-it-works.md
   - Deployment:
@@ -18,9 +19,10 @@ nav:
       - Ingress:
           - Annotations: guide/ingress/annotations.md
           - Specification: guide/ingress/spec.md
+          - IngressClass: guide/ingress/ingress_class.md
           - Certificate Discovery: guide/ingress/cert_discovery.md
       - Service:
-          - NLB-IP mode: guide/service/nlb_ip_mode.md
+          - NLB: guide/service/nlb.md
           - Annotations: guide/service/annotations.md
       - TargetGroupBinding:
           - TargetGroupBinding: guide/targetgroupbinding/targetgroupbinding.md
@@ -30,7 +32,8 @@ nav:
           - SSL Redirect: guide/tasks/ssl_redirect.md
   - Examples:
     - EchoServer: examples/echo_server.md
-      
+    - gRPCServer: examples/grpc_server.md
+
 
 
 plugins:

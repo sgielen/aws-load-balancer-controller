@@ -15,7 +15,6 @@ import (
 	k8sresources "sigs.k8s.io/aws-load-balancer-controller/test/framework/resources/k8s"
 	"sigs.k8s.io/aws-load-balancer-controller/test/framework/utils"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -35,8 +34,7 @@ type Framework struct {
 
 	HTTPVerifier http.Verifier
 
-	Logger   logr.Logger
-	StopChan <-chan struct{}
+	Logger utils.GinkgoLogger
 }
 
 func InitFramework() (*Framework, error) {
@@ -50,28 +48,11 @@ func InitFramework() (*Framework, error) {
 	clientgoscheme.AddToScheme(k8sSchema)
 	elbv2api.AddToScheme(k8sSchema)
 
-	stopChan := ctrl.SetupSignalHandler()
-	cache, err := cache.New(restCfg, cache.Options{Scheme: k8sSchema})
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		cache.Start(stopChan)
-	}()
-	cache.WaitForCacheSync(stopChan)
-	realClient, err := client.New(restCfg, client.Options{Scheme: k8sSchema})
+	k8sClient, err := client.New(restCfg, client.Options{Scheme: k8sSchema})
 	if err != nil {
 		return nil, err
 	}
 
-	k8sClient := client.DelegatingClient{
-		Reader: &client.DelegatingReader{
-			CacheReader:  cache,
-			ClientReader: realClient,
-		},
-		Writer:       realClient,
-		StatusClient: realClient,
-	}
 	cloud, err := aws.NewCloud(aws.CloudConfig{
 		Region:         globalOptions.AWSRegion,
 		VpcID:          globalOptions.AWSVPCID,
@@ -100,8 +81,7 @@ func InitFramework() (*Framework, error) {
 
 		HTTPVerifier: http.NewDefaultVerifier(),
 
-		Logger:   logger,
-		StopChan: stopChan,
+		Logger: logger,
 	}
 
 	return f, nil

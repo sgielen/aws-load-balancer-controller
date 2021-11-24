@@ -6,6 +6,7 @@
 *.so
 *.dylib
 bin
+build
 
 # mkdocs generated live docs
 site
@@ -16,12 +17,9 @@ site
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Kubernetes Generated files - skip generated files, except for vendored files
-
-!vendor/**/zz_generated.*
-
 # editor and IDE paraphernalia
 .idea
+.vscode
 *.swp
 *.swo
 *~

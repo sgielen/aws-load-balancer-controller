@@ -3,9 +3,12 @@ package service
 import (
 	"context"
 	"errors"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
 	"testing"
+
+	elbv2sdk "github.com/aws/aws-sdk-go/service/elbv2"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -14,8 +17,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
+	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 )
+
+const lbAttrsDeletionProtectionEnabled = "deletion_protection.enabled"
 
 func Test_defaultModelBuilderTask_buildLBAttributes(t *testing.T) {
 	tests := []struct {
@@ -34,24 +41,7 @@ func Test_defaultModelBuilderTask_buildLBAttributes(t *testing.T) {
 				},
 			},
 			wantError: false,
-			wantValue: []elbv2.LoadBalancerAttribute{
-				{
-					Key:   lbAttrsAccessLogsS3Enabled,
-					Value: "false",
-				},
-				{
-					Key:   lbAttrsAccessLogsS3Bucket,
-					Value: "",
-				},
-				{
-					Key:   lbAttrsAccessLogsS3Prefix,
-					Value: "",
-				},
-				{
-					Key:   lbAttrsLoadBalancingCrossZoneEnabled,
-					Value: "false",
-				},
-			},
+			wantValue: []elbv2.LoadBalancerAttribute{},
 		},
 		{
 			testName: "Annotation specified",
@@ -63,6 +53,7 @@ func Test_defaultModelBuilderTask_buildLBAttributes(t *testing.T) {
 						"service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-name":         "nlb-bucket",
 						"service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-prefix":       "bkt-pfx",
 						"service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled": "true",
+						"service.beta.kubernetes.io/aws-load-balancer-attributes":                        "deletion_protection.enabled=true",
 					},
 				},
 			},
@@ -83,6 +74,78 @@ func Test_defaultModelBuilderTask_buildLBAttributes(t *testing.T) {
 				{
 					Key:   lbAttrsLoadBalancingCrossZoneEnabled,
 					Value: "true",
+				},
+				{
+					Key:   lbAttrsDeletionProtectionEnabled,
+					Value: "true",
+				},
+			},
+		},
+		{
+			testName: "Attributes from config map annotation",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-attributes": "access_logs.s3.enabled=true,access_logs.s3.bucket=nlb-bucket," +
+							"access_logs.s3.prefix=bkt-pfx,load_balancing.cross_zone.enabled=true,deletion_protection.enabled=true",
+					},
+				},
+			},
+			wantError: false,
+			wantValue: []elbv2.LoadBalancerAttribute{
+				{
+					Key:   lbAttrsAccessLogsS3Enabled,
+					Value: "true",
+				},
+				{
+					Key:   lbAttrsAccessLogsS3Bucket,
+					Value: "nlb-bucket",
+				},
+				{
+					Key:   lbAttrsAccessLogsS3Prefix,
+					Value: "bkt-pfx",
+				},
+				{
+					Key:   lbAttrsLoadBalancingCrossZoneEnabled,
+					Value: "true",
+				},
+				{
+					Key:   lbAttrsDeletionProtectionEnabled,
+					Value: "true",
+				},
+			},
+		},
+		{
+			testName: "Specific config overrides config map",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-attributes": "access_logs.s3.enabled=false,access_logs.s3.bucket=nlb-bucket," +
+							"access_logs.s3.prefix=bkt-pfx,load_balancing.cross_zone.enabled=true",
+						"service.beta.kubernetes.io/aws-load-balancer-access-log-enabled":                "true",
+						"service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-name":         "overridden-nlb-bucket",
+						"service.beta.kubernetes.io/aws-load-balancer-access-log-s3-bucket-prefix":       "overridden-bkt-pfx",
+						"service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled": "false",
+					},
+				},
+			},
+			wantError: false,
+			wantValue: []elbv2.LoadBalancerAttribute{
+				{
+					Key:   lbAttrsAccessLogsS3Enabled,
+					Value: "true",
+				},
+				{
+					Key:   lbAttrsAccessLogsS3Bucket,
+					Value: "overridden-nlb-bucket",
+				},
+				{
+					Key:   lbAttrsAccessLogsS3Prefix,
+					Value: "overridden-bkt-pfx",
+				},
+				{
+					Key:   lbAttrsLoadBalancingCrossZoneEnabled,
+					Value: "false",
 				},
 			},
 		},
@@ -124,7 +187,7 @@ func Test_defaultModelBuilderTask_buildLBAttributes(t *testing.T) {
 			if tt.wantError {
 				assert.Error(t, err)
 			} else {
-				assert.Equal(t, tt.wantValue, lbAttributes)
+				assert.ElementsMatch(t, tt.wantValue, lbAttributes)
 			}
 		})
 	}
@@ -469,31 +532,56 @@ func Test_defaultModelBuilderTask_getMatchingIPforSubnet(t *testing.T) {
 	}
 }
 
-func Test_defaultModelBuilderTask_resolveLoadBalancerSubnets(t *testing.T) {
+func Test_defaultModelBuilderTask_buildLoadBalancerSubnets(t *testing.T) {
 	type resolveSubnetResults struct {
 		subnets []*ec2.Subnet
 		err     error
 	}
+	type args struct {
+		stack core.Stack
+	}
+	type listLoadBalancerCall struct {
+		sdkLBs []elbv2deploy.LoadBalancerWithTags
+		err    error
+	}
+	listLoadBalancerCallForEmptyLB := listLoadBalancerCall{
+		sdkLBs: []elbv2deploy.LoadBalancerWithTags{},
+	}
 	tests := []struct {
-		name                     string
-		svc                      *corev1.Service
-		scheme                   elbv2.LoadBalancerScheme
-		resolveViaDiscovery      []resolveSubnetResults
-		resolveViaNameOrIDSlilce []resolveSubnetResults
+		name                          string
+		svc                           *corev1.Service
+		scheme                        elbv2.LoadBalancerScheme
+		provider                      tracking.Provider
+		args                          args
+		listLoadBalancersCalls        []listLoadBalancerCall
+		resolveViaDiscoveryCalls      []resolveSubnetResults
+		resolveViaNameOrIDSlilceCalls []resolveSubnetResults
+		want                          map[string]string
 	}{
 		{
-			name:   "subnet auto-discovery",
-			svc:    &corev1.Service{},
-			scheme: elbv2.LoadBalancerSchemeInternal,
-			resolveViaDiscovery: []resolveSubnetResults{
+			name:                   "subnet auto-discovery",
+			svc:                    &corev1.Service{},
+			scheme:                 elbv2.LoadBalancerSchemeInternal,
+			provider:               tracking.NewDefaultProvider("service.k8s.aws", "cluster-name"),
+			args:                   args{stack: core.NewDefaultStack(core.StackID{Namespace: "namespace", Name: "serviceName"})},
+			listLoadBalancersCalls: []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			resolveViaDiscoveryCalls: []resolveSubnetResults{
 				{
 					subnets: []*ec2.Subnet{
 						{
-							SubnetId:  aws.String("subnet-1"),
+							SubnetId:  aws.String("subnet-a"),
 							CidrBlock: aws.String("192.168.0.0/19"),
+						},
+						{
+							SubnetId:  aws.String("subnet-b"),
+							CidrBlock: aws.String("192.168.32.0/19"),
 						},
 					},
 				},
+			},
+			want: map[string]string{
+				"elbv2.k8s.aws/cluster": "cluster-name",
+				"service.k8s.aws/stack": "namespace/serviceName",
 			},
 		},
 		{
@@ -505,8 +593,10 @@ func Test_defaultModelBuilderTask_resolveLoadBalancerSubnets(t *testing.T) {
 					},
 				},
 			},
-			scheme: elbv2.LoadBalancerSchemeInternal,
-			resolveViaNameOrIDSlilce: []resolveSubnetResults{
+			scheme:   elbv2.LoadBalancerSchemeInternal,
+			provider: tracking.NewDefaultProvider("service.k8s.aws", "cluster-name"),
+			args:     args{stack: core.NewDefaultStack(core.StackID{Namespace: "namespace", Name: "serviceName"})},
+			resolveViaNameOrIDSlilceCalls: []resolveSubnetResults{
 				{
 					subnets: []*ec2.Subnet{
 						{
@@ -520,6 +610,58 @@ func Test_defaultModelBuilderTask_resolveLoadBalancerSubnets(t *testing.T) {
 					},
 				},
 			},
+			want: map[string]string{
+				"elbv2.k8s.aws/cluster": "cluster-name",
+				"service.k8s.aws/stack": "namespace/serviceName",
+			},
+		},
+		{
+			name:     "subnet resolve via Name or ID",
+			svc:      &corev1.Service{},
+			scheme:   elbv2.LoadBalancerSchemeInternal,
+			provider: tracking.NewDefaultProvider("service.k8s.aws", "cluster-name"),
+			args:     args{stack: core.NewDefaultStack(core.StackID{Namespace: "namespace", Name: "serviceName"})},
+			listLoadBalancersCalls: []listLoadBalancerCall{
+				{
+					sdkLBs: []elbv2deploy.LoadBalancerWithTags{
+						{
+							LoadBalancer: &elbv2sdk.LoadBalancer{
+								LoadBalancerArn: aws.String("lb-1"),
+								AvailabilityZones: []*elbv2sdk.AvailabilityZone{
+									{
+										SubnetId: aws.String("subnet-c"),
+									},
+									{
+										SubnetId: aws.String("subnet-d"),
+									},
+								},
+							},
+							Tags: map[string]string{
+								"elbv2.k8s.aws/cluster": "cluster-name",
+								"service.k8s.aws/stack": "namespace/serviceName",
+							},
+						},
+					},
+				},
+			},
+			resolveViaNameOrIDSlilceCalls: []resolveSubnetResults{
+				{
+					subnets: []*ec2.Subnet{
+						{
+							SubnetId:  aws.String("subnet-c"),
+							CidrBlock: aws.String("192.168.0.0/19"),
+						},
+						{
+							SubnetId:  aws.String("subnet-d"),
+							CidrBlock: aws.String("192.168.0.0/19"),
+						},
+					},
+				},
+			},
+			want: map[string]string{
+				"elbv2.k8s.aws/cluster": "cluster-name",
+				"service.k8s.aws/stack": "namespace/serviceName",
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -527,17 +669,36 @@ func Test_defaultModelBuilderTask_resolveLoadBalancerSubnets(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
+			elbv2TaggingManager := elbv2deploy.NewMockTaggingManager(ctrl)
+			for _, call := range tt.listLoadBalancersCalls {
+				elbv2TaggingManager.EXPECT().ListLoadBalancers(gomock.Any(), gomock.Any()).Return(call.sdkLBs, call.err)
+			}
+
 			subnetsResolver := networking.NewMockSubnetsResolver(ctrl)
-			for _, call := range tt.resolveViaDiscovery {
+			for _, call := range tt.resolveViaDiscoveryCalls {
 				subnetsResolver.EXPECT().ResolveViaDiscovery(gomock.Any(), gomock.Any()).Return(call.subnets, call.err)
 			}
-			for _, call := range tt.resolveViaNameOrIDSlilce {
+			for _, call := range tt.resolveViaNameOrIDSlilceCalls {
 				subnetsResolver.EXPECT().ResolveViaNameOrIDSlice(gomock.Any(), gomock.Any(), gomock.Any()).Return(call.subnets, call.err)
 			}
 			annotationParser := annotations.NewSuffixAnnotationParser("service.beta.kubernetes.io")
-			builder := &defaultModelBuildTask{service: tt.svc, annotationParser: annotationParser, subnetsResolver: subnetsResolver}
 
-			builder.resolveLoadBalancerSubnets(context.Background(), tt.scheme)
+			clusterName := "cluster-name"
+			trackingProvider := tracking.NewDefaultProvider("ingress.k8s.aws", clusterName)
+
+			builder := &defaultModelBuildTask{
+				clusterName:         clusterName,
+				service:             tt.svc,
+				stack:               tt.args.stack,
+				annotationParser:    annotationParser,
+				subnetsResolver:     subnetsResolver,
+				trackingProvider:    trackingProvider,
+				elbv2TaggingManager: elbv2TaggingManager,
+			}
+			var got = tt.provider.StackTags(tt.args.stack)
+			assert.Equal(t, tt.want, got)
+
+			builder.buildLoadBalancerSubnets(context.Background(), tt.scheme)
 		})
 	}
 }
@@ -751,6 +912,7 @@ func Test_defaultModelBuildTask_buildLoadBalancerName(t *testing.T) {
 		clusterName string
 		scheme      elbv2.LoadBalancerScheme
 		want        string
+		wantErr     error
 	}{
 		{
 			name: "no name annotation",
@@ -778,6 +940,19 @@ func Test_defaultModelBuildTask_buildLoadBalancerName(t *testing.T) {
 			},
 			want: "baz",
 		},
+		{
+			name: "reject name longer than 32 characters",
+			service: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "foo",
+					Name:      "bar",
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-name": "bazbazfoofoobazbazfoofoobazbazfoo",
+					},
+				},
+			},
+			wantErr: errors.New("load balancer name cannot be longer than 32 characters"),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -786,8 +961,12 @@ func Test_defaultModelBuildTask_buildLoadBalancerName(t *testing.T) {
 				clusterName:      tt.clusterName,
 				annotationParser: annotations.NewSuffixAnnotationParser("service.beta.kubernetes.io"),
 			}
-			got := task.buildLoadBalancerName(context.Background(), tt.scheme)
-			assert.Equal(t, tt.want, got)
+			got, err := task.buildLoadBalancerName(context.Background(), tt.scheme)
+			if err != nil {
+				assert.EqualError(t, err, tt.wantErr.Error())
+			} else {
+				assert.Equal(t, tt.want, got)
+			}
 		})
 	}
 }

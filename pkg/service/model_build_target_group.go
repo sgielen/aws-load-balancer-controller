@@ -5,20 +5,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"regexp"
 	elbv2api "sigs.k8s.io/aws-load-balancer-controller/apis/elbv2/v1beta1"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/k8s"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
-	"sort"
-	"strconv"
-	"strings"
 )
 
 const (
@@ -70,11 +71,19 @@ func (t *defaultModelBuildTask) buildTargetGroupSpec(ctx context.Context, tgProt
 	}
 	targetPort := t.buildTargetGroupPort(ctx, targetType, port)
 	tgName := t.buildTargetGroupName(ctx, intstr.FromInt(int(port.Port)), targetPort, targetType, tgProtocol, healthCheckConfig)
+	ipAddressType, err := t.buildTargetGroupIPAddressType(ctx, t.service)
+	if err != nil {
+		return elbv2model.TargetGroupSpec{}, err
+	}
+	if ipAddressType == elbv2model.TargetGroupIPAddressTypeIPv6 {
+		return elbv2model.TargetGroupSpec{}, errors.New("ipv6 target group not supported for NLB")
+	}
 	return elbv2model.TargetGroupSpec{
 		Name:                  tgName,
 		TargetType:            targetType,
 		Port:                  targetPort,
 		Protocol:              tgProtocol,
+		IPAddressType:         &ipAddressType,
 		HealthCheckConfig:     healthCheckConfig,
 		TargetGroupAttributes: tgAttrs,
 		Tags:                  tags,
@@ -326,6 +335,7 @@ func (t *defaultModelBuildTask) buildTargetGroupHealthCheckUnhealthyThresholdCou
 }
 
 func (t *defaultModelBuildTask) buildTargetType(_ context.Context) (elbv2model.TargetType, error) {
+	svcType := t.service.Spec.Type
 	var lbType string
 	_ = t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixLoadBalancerType, &lbType, t.service.Annotations)
 	var lbTargetType string
@@ -334,6 +344,9 @@ func (t *defaultModelBuildTask) buildTargetType(_ context.Context) (elbv2model.T
 		return elbv2model.TargetTypeIP, nil
 	}
 	if lbType == LoadBalancerTypeExternal && lbTargetType == LoadBalancerTargetTypeInstance {
+		if svcType == corev1.ServiceTypeClusterIP {
+			return "", errors.Errorf("unsupported service type \"%v\" for load balancer target type \"%v\"", svcType, lbTargetType)
+		}
 		return elbv2model.TargetTypeInstance, nil
 	}
 	return "", errors.Errorf("unsupported target type \"%v\" for load balancer type \"%v\"", lbTargetType, lbType)
@@ -375,7 +388,7 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingSpec(ctx context.Context,
 		targetPort = intstr.FromInt(int(port.NodePort))
 	}
 	defaultSourceRanges := []string{"0.0.0.0/0"}
-	if preserveClientIP && scheme == elbv2model.LoadBalancerSchemeInternal {
+	if (port.Protocol == corev1.ProtocolUDP || preserveClientIP) && scheme == elbv2model.LoadBalancerSchemeInternal {
 		defaultSourceRanges, err = t.vpcResolver.ResolveCIDRs(ctx)
 		if err != nil {
 			return elbv2model.TargetGroupBindingResourceSpec{}, err
@@ -398,16 +411,18 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingSpec(ctx context.Context,
 					Name: t.service.Name,
 					Port: intstr.FromInt(int(port.Port)),
 				},
-				Networking:   tgbNetworking,
-				NodeSelector: nodeSelector,
+				Networking:    tgbNetworking,
+				NodeSelector:  nodeSelector,
+				IPAddressType: (*elbv2api.TargetGroupIPAddressType)(targetGroup.Spec.IPAddressType),
 			},
 		},
 	}, nil
 }
 
-func (t *defaultModelBuildTask) buildPeersFromSourceRanges(_ context.Context, defaultSourceRanges []string) []elbv2model.NetworkingPeer {
+func (t *defaultModelBuildTask) buildPeersFromSourceRanges(_ context.Context, defaultSourceRanges []string) ([]elbv2model.NetworkingPeer, bool) {
 	var sourceRanges []string
 	var peers []elbv2model.NetworkingPeer
+	customSourceRangesConfigured := true
 	for _, cidr := range t.service.Spec.LoadBalancerSourceRanges {
 		sourceRanges = append(sourceRanges, cidr)
 	}
@@ -416,6 +431,7 @@ func (t *defaultModelBuildTask) buildPeersFromSourceRanges(_ context.Context, de
 	}
 	if len(sourceRanges) == 0 {
 		sourceRanges = defaultSourceRanges
+		customSourceRangesConfigured = false
 	}
 	for _, cidr := range sourceRanges {
 		peers = append(peers, elbv2model.NetworkingPeer{
@@ -424,7 +440,7 @@ func (t *defaultModelBuildTask) buildPeersFromSourceRanges(_ context.Context, de
 			},
 		})
 	}
-	return peers
+	return peers, customSourceRangesConfigured
 }
 
 func (t *defaultModelBuildTask) buildTargetGroupBindingNetworking(ctx context.Context, tgPort intstr.IntOrString, preserveClientIP bool,
@@ -448,8 +464,9 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingNetworking(ctx context.Co
 		},
 	}
 	trafficSource := fromVPC
+	customSourceRangesConfigured := false
 	if networkingProtocol == elbv2api.NetworkingProtocolUDP || preserveClientIP {
-		trafficSource = t.buildPeersFromSourceRanges(ctx, defaultSourceRanges)
+		trafficSource, customSourceRangesConfigured = t.buildPeersFromSourceRanges(ctx, defaultSourceRanges)
 	}
 	tgbNetworking := &elbv2model.TargetGroupBindingNetworking{
 		Ingress: []elbv2model.NetworkingIngressRule{
@@ -459,23 +476,28 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingNetworking(ctx context.Co
 			},
 		},
 	}
-	if preserveClientIP || tgProtocol == corev1.ProtocolUDP || (hcPort.String() != healthCheckPortTrafficPort && hcPort.IntValue() != tgPort.IntValue()) {
-		var healthCheckPorts []elbv2api.NetworkingPort
-		networkingProtocolTCP := elbv2api.NetworkingProtocolTCP
-		networkingHealthCheckPort := hcPort
-		if hcPort.String() == healthCheckPortTrafficPort {
-			networkingHealthCheckPort = tgPort
-		}
-		healthCheckPorts = append(healthCheckPorts, elbv2api.NetworkingPort{
-			Port:     &networkingHealthCheckPort,
-			Protocol: &networkingProtocolTCP,
-		})
-		tgbNetworking.Ingress = append(tgbNetworking.Ingress, elbv2model.NetworkingIngressRule{
-			From:  fromVPC,
-			Ports: healthCheckPorts,
-		})
+	if hcIngressRules := t.buildHealthCheckNetworkingIngressRules(trafficSource, fromVPC, tgPort, hcPort, tgProtocol,
+		preserveClientIP, customSourceRangesConfigured); len(hcIngressRules) > 0 {
+		tgbNetworking.Ingress = append(tgbNetworking.Ingress, hcIngressRules...)
 	}
 	return tgbNetworking
+}
+
+func (t *defaultModelBuildTask) buildTargetGroupIPAddressType(_ context.Context, svc *corev1.Service) (elbv2model.TargetGroupIPAddressType, error) {
+	var ipv6Configured bool
+	for _, ipFamily := range svc.Spec.IPFamilies {
+		if ipFamily == corev1.IPv6Protocol {
+			ipv6Configured = true
+			break
+		}
+	}
+	if ipv6Configured {
+		if *t.loadBalancer.Spec.IPAddressType != elbv2model.IPAddressTypeDualStack {
+			return "", errors.New("unsupported IPv6 configuration, lb not dual-stack")
+		}
+		return elbv2model.TargetGroupIPAddressTypeIPv6, nil
+	}
+	return elbv2model.TargetGroupIPAddressTypeIPv4, nil
 }
 
 func (t *defaultModelBuildTask) buildTargetGroupBindingNodeSelector(_ context.Context, targetType elbv2model.TargetType) (*metav1.LabelSelector, error) {
@@ -492,4 +514,36 @@ func (t *defaultModelBuildTask) buildTargetGroupBindingNodeSelector(_ context.Co
 	return &metav1.LabelSelector{
 		MatchLabels: targetNodeLabels,
 	}, nil
+}
+
+func (t *defaultModelBuildTask) buildHealthCheckNetworkingIngressRules(trafficSource, hcSource []elbv2model.NetworkingPeer, tgPort, hcPort intstr.IntOrString,
+	tgProtocol corev1.Protocol, preserveClientIP, customSoureRanges bool) []elbv2model.NetworkingIngressRule {
+	if tgProtocol != corev1.ProtocolUDP &&
+		(hcPort.String() == healthCheckPortTrafficPort || hcPort.IntValue() == tgPort.IntValue()) {
+		if !preserveClientIP {
+			return []elbv2model.NetworkingIngressRule{}
+		}
+		if !customSoureRanges {
+			return []elbv2model.NetworkingIngressRule{}
+		}
+		for _, src := range trafficSource {
+			if src.IPBlock.CIDR == "0.0.0.0/0" {
+				return []elbv2model.NetworkingIngressRule{}
+			}
+		}
+	}
+	var healthCheckPorts []elbv2api.NetworkingPort
+	networkingProtocolTCP := elbv2api.NetworkingProtocolTCP
+	networkingHealthCheckPort := hcPort
+	if hcPort.String() == healthCheckPortTrafficPort {
+		networkingHealthCheckPort = tgPort
+	}
+	healthCheckPorts = append(healthCheckPorts, elbv2api.NetworkingPort{
+		Port:     &networkingHealthCheckPort,
+		Protocol: &networkingProtocolTCP,
+	})
+	return []elbv2model.NetworkingIngressRule{{
+		From:  hcSource,
+		Ports: healthCheckPorts,
+	}}
 }

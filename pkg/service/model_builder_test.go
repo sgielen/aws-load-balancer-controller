@@ -26,6 +26,10 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 		subnets []*ec2.Subnet
 		err     error
 	}
+	type resolveViaNameOrIDSliceCall struct {
+		subnets []*ec2.Subnet
+		err     error
+	}
 	type listLoadBalancerCall struct {
 		sdkLBs []elbv2.LoadBalancerWithTags
 		err    error
@@ -70,16 +74,35 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 			},
 		},
 	}
-
+	resolveViaNameOrIDSliceCallForThreeSubnet := resolveViaNameOrIDSliceCall{
+		subnets: []*ec2.Subnet{
+			{
+				SubnetId:  aws.String("subnet-1"),
+				CidrBlock: aws.String("192.168.0.0/19"),
+			},
+			{
+				SubnetId:  aws.String("subnet-2"),
+				CidrBlock: aws.String("192.168.32.0/19"),
+			},
+			{
+				SubnetId:  aws.String("subnet-3"),
+				CidrBlock: aws.String("192.168.64.0/19"),
+			},
+		},
+	}
+	listLoadBalancerCallForEmptyLB := listLoadBalancerCall{
+		sdkLBs: []elbv2.LoadBalancerWithTags{},
+	}
 	tests := []struct {
-		testName                 string
-		resolveViaDiscoveryCalls []resolveViaDiscoveryCall
-		listLoadBalancerCalls    []listLoadBalancerCall
-		resolveCIDRsCalls        []resolveCIDRsCall
-		svc                      *corev1.Service
-		wantError                bool
-		wantValue                string
-		wantNumResources         int
+		testName                     string
+		resolveViaDiscoveryCalls     []resolveViaDiscoveryCall
+		resolveViaNameOrIDSliceCalls []resolveViaNameOrIDSliceCall
+		listLoadBalancerCalls        []listLoadBalancerCall
+		resolveCIDRsCalls            []resolveCIDRsCall
+		svc                          *corev1.Service
+		wantError                    bool
+		wantValue                    string
+		wantNumResources             int
 	}{
 		{
 			testName: "Simple service",
@@ -105,6 +128,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 				},
 			},
 			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForOneSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
 			wantError:                false,
 			wantValue: `
 {
@@ -146,24 +170,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                 {
                    "subnetID":"subnet-1"
                 }
-             ],
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
              ]
           }
        }
@@ -173,6 +179,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-d4818dcd51",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -205,6 +212,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc-tls:80/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc-tls",
                       "port":80
@@ -264,6 +272,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 				},
 			},
 			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForOneSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
 			wantError:                false,
 			wantValue: `
 {
@@ -305,24 +314,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                 {
                    "subnetID":"subnet-1"
                 }
-             ],
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
              ]
           }
        }
@@ -332,6 +323,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-d4818dcd51",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -364,6 +356,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc-tls:80/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc-tls",
                       "port":80
@@ -436,6 +429,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 				},
 			},
 			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForTwoSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
 			wantError:                false,
 			wantValue: `
 {
@@ -503,24 +497,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                 {
                    "subnetID":"subnet-2"
                 }
-             ],
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
              ]
           }
        }
@@ -530,6 +506,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-62f81639fc",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -552,6 +529,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-3ede6b28b6",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -585,6 +563,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc:80/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc",
                       "port":80
@@ -650,6 +629,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc:83/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc",
                       "port":83
@@ -753,6 +733,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 				},
 			},
 			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForThreeSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
 			wantError:                false,
 			wantValue: `
 {
@@ -835,12 +816,12 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
              ],
              "loadBalancerAttributes":[
                 {
-                   "key":"access_logs.s3.enabled",
-                   "value":"true"
-                },
-                {
                    "key":"access_logs.s3.bucket",
                    "value":"nlb-bucket"
+                },
+                {
+                   "key":"access_logs.s3.enabled",
+                   "value":"true"
                 },
                 {
                    "key":"access_logs.s3.prefix",
@@ -859,6 +840,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-62f81639fc",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -881,6 +863,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-77ea0c7734",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":8883,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -914,6 +897,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc-tls:80/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc-tls",
                       "port":80
@@ -964,6 +948,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc-tls:83/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc-tls",
                       "port":83
@@ -1095,7 +1080,8 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 					cidrs: []string{"192.168.0.0/16"},
 				},
 			},
-			wantError: false,
+			listLoadBalancerCalls: []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			wantError:             false,
 			wantValue: `
 {
  "id":"default/instance-mode",
@@ -1165,24 +1151,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                 {
                    "subnetID":"subnet-3"
                 }
-             ],
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
              ]
           }
        }
@@ -1192,6 +1160,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-instance-0c68c79423",
              "targetType":"instance",
+             "ipAddressType":"ipv4",
              "port":31223,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -1213,6 +1182,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-instance-c200165858",
              "targetType":"instance",
+             "ipAddressType":"ipv4",
              "port":32323,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -1245,6 +1215,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/instance-mode:80/status/targetGroupARN"
                    },
                    "targetType":"instance",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"instance-mode",
                       "port":80
@@ -1256,31 +1227,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                                {
                                   "ipBlock":{
                                      "cidr":"192.168.0.0/16"
-                                  }
-                               }
-                            ],
-                            "ports":[
-                               {
-                                  "protocol":"TCP",
-                                  "port":31223
-                               }
-                            ]
-                         },
-                         {
-                            "from":[
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.0.0/19"
-                                  }
-                               },
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.32.0/19"
-                                  }
-                               },
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.64.0/19"
                                   }
                                }
                             ],
@@ -1310,6 +1256,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/instance-mode:83/status/targetGroupARN"
                    },
                    "targetType":"instance",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"instance-mode",
                       "port":83
@@ -1321,31 +1268,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                                {
                                   "ipBlock":{
                                      "cidr":"192.168.0.0/16"
-                                  }
-                               }
-                            ],
-                            "ports":[
-                               {
-                                  "protocol":"TCP",
-                                  "port":32323
-                               }
-                            ]
-                         },
-                         {
-                            "from":[
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.0.0/19"
-                                  }
-                               },
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.32.0/19"
-                                  }
-                               },
-                               {
-                                  "ipBlock":{
-                                     "cidr":"192.168.64.0/19"
                                   }
                                }
                             ],
@@ -1416,7 +1338,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 					},
 				},
 			},
-			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForThreeSubnet},
+			resolveViaNameOrIDSliceCalls: []resolveViaNameOrIDSliceCall{resolveViaNameOrIDSliceCallForThreeSubnet},
 			listLoadBalancerCalls: []listLoadBalancerCall{
 				{
 					sdkLBs: []elbv2.LoadBalancerWithTags{
@@ -1498,24 +1420,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                 {
                    "subnetID":"subnet-3"
                 }
-             ],
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
              ]
           }
        }
@@ -1525,6 +1429,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-app-trafficl-d2b8571b2f",
              "targetType":"instance",
+             "ipAddressType":"ipv4",
              "port":31223,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -1547,6 +1452,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-app-trafficl-4be0ac1fb8",
              "targetType":"instance",
+             "ipAddressType":"ipv4",
              "port":32323,
              "protocol":"TCP",
              "healthCheckConfig":{
@@ -1580,6 +1486,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/app/traffic-local:80/status/targetGroupARN"
                    },
                    "targetType":"instance",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"traffic-local",
                       "port":80
@@ -1650,6 +1557,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/app/traffic-local:83/status/targetGroupARN"
                    },
                    "targetType":"instance",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"traffic-local",
                       "port":83
@@ -1738,6 +1646,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 				},
 			},
 			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForOneSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
 			wantError:                false,
 			wantValue: `
 {
@@ -1787,25 +1696,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
              "tags": {
                "tag2/purpose": "test.2",
                "resource.tag1": "value1"
-             },
-             "loadBalancerAttributes":[
-                {
-                   "key":"access_logs.s3.enabled",
-                   "value":"false"
-                },
-                {
-                   "key":"access_logs.s3.bucket",
-                   "value":""
-                },
-                {
-                   "key":"access_logs.s3.prefix",
-                   "value":""
-                },
-                {
-                   "key":"load_balancing.cross_zone.enabled",
-                   "value":"false"
-                }
-             ]
+             }
           }
        }
     },
@@ -1814,6 +1705,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "spec":{
              "name":"k8s-default-nlbipsvc-d4818dcd51",
              "targetType":"ip",
+             "ipAddressType":"ipv4",
              "port":80,
              "protocol":"TCP",
              "tags": {
@@ -1850,6 +1742,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       "$ref":"#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/nlb-ip-svc-tls:80/status/targetGroupARN"
                    },
                    "targetType":"ip",
+                   "ipAddressType":"ipv4",
                    "serviceRef":{
                       "name":"nlb-ip-svc-tls",
                       "port":80
@@ -1914,7 +1807,8 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 					cidrs: []string{"192.160.0.0/16", "100.64.0.0/16"},
 				},
 			},
-			wantNumResources: 4,
+			listLoadBalancerCalls: []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			wantNumResources:      4,
 			wantValue: `
 {
   "id": "default/ip-target",
@@ -1950,6 +1844,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
           "template": {
             "spec": {
               "targetType": "ip",
+              "ipAddressType":"ipv4",
               "targetGroupARN": {
                 "$ref": "#/resources/AWS::ElasticLoadBalancingV2::TargetGroup/default/ip-target:80/status/targetGroupARN"
               },
@@ -1965,21 +1860,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
                       {
                         "ipBlock": {
                           "cidr": "100.64.0.0/16"
-                        }
-                      }
-                    ],
-                    "ports": [
-                      {
-                        "protocol": "TCP",
-                        "port": 80
-                      }
-                    ]
-                  },
-                  {
-                    "from": [
-                      {
-                        "ipBlock": {
-                          "cidr": "192.168.0.0/19"
                         }
                       }
                     ],
@@ -2011,24 +1891,6 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
         "spec": {
           "ipAddressType": "ipv4",
           "name": "k8s-default-iptarget-b44ef5a42d",
-          "loadBalancerAttributes": [
-            {
-              "value": "false",
-              "key": "access_logs.s3.enabled"
-            },
-            {
-              "value": "",
-              "key": "access_logs.s3.bucket"
-            },
-            {
-              "value": "",
-              "key": "access_logs.s3.prefix"
-            },
-            {
-              "value": "false",
-              "key": "load_balancing.cross_zone.enabled"
-            }
-          ],
           "subnetMapping": [
             {
               "subnetID": "subnet-1"
@@ -2043,6 +1905,7 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
       "default/ip-target:80": {
         "spec": {
           "targetType": "ip",
+          "ipAddressType":"ipv4",
           "protocol": "TCP",
           "name": "k8s-default-iptarget-cc40ce9c73",
           "healthCheckConfig": {
@@ -2092,7 +1955,8 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 			},
 			listLoadBalancerCalls: []listLoadBalancerCall{
 				{
-					err: errors.New("error listing load balancer"),
+					sdkLBs: []elbv2.LoadBalancerWithTags{},
+					err:    errors.New("error listing load balancer"),
 				},
 			},
 			wantError: true,
@@ -2126,7 +1990,95 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 					err: errors.New("unable to resolve VPC CIDRs"),
 				},
 			},
+			listLoadBalancerCalls: []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			wantError:             true,
+		},
+		{
+			testName: "deletion protection enabled error",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hello-svc",
+					Namespace: "default",
+					UID:       "bdca2bd0-bfc6-449a-88a3-03451f05f18c",
+					DeletionTimestamp: &metav1.Time{
+						Time: time.Now(),
+					},
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
+						"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "ip",
+						"service.beta.kubernetes.io/aws-load-balancer-attributes":      "deletion_protection.enabled=true",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:     corev1.ServiceTypeLoadBalancer,
+					Selector: map[string]string{"app": "hello"},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							TargetPort: intstr.FromInt(80),
+							Protocol:   corev1.ProtocolTCP,
+						},
+					},
+				},
+			},
 			wantError: true,
+		},
+		{
+			testName: "ipv6 service without dualstask",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "traffic-local",
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
+						"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:       corev1.ServiceTypeLoadBalancer,
+					Selector:   map[string]string{"app": "hello"},
+					IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							TargetPort: intstr.FromInt(80),
+							Protocol:   corev1.ProtocolTCP,
+							NodePort:   32332,
+						},
+					},
+				},
+			},
+			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForOneSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			wantError:                true,
+		},
+		{
+			testName: "ipv6 not available for NLB",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "traffic-local",
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
+						"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
+						"service.beta.kubernetes.io/aws-load-balancer-ip-address-type": "dualstack",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:       corev1.ServiceTypeLoadBalancer,
+					Selector:   map[string]string{"app": "hello"},
+					IPFamilies: []corev1.IPFamily{corev1.IPv6Protocol},
+					Ports: []corev1.ServicePort{
+						{
+							Port:       80,
+							TargetPort: intstr.FromInt(80),
+							Protocol:   corev1.ProtocolTCP,
+							NodePort:   32332,
+						},
+					},
+				},
+			},
+			resolveViaDiscoveryCalls: []resolveViaDiscoveryCall{resolveViaDiscoveryCallForOneSubnet},
+			listLoadBalancerCalls:    []listLoadBalancerCall{listLoadBalancerCallForEmptyLB},
+			wantError:                true,
 		},
 	}
 
@@ -2138,6 +2090,9 @@ func Test_defaultModelBuilderTask_Build(t *testing.T) {
 			subnetsResolver := networking.NewMockSubnetsResolver(ctrl)
 			for _, call := range tt.resolveViaDiscoveryCalls {
 				subnetsResolver.EXPECT().ResolveViaDiscovery(gomock.Any(), gomock.Any()).Return(call.subnets, call.err)
+			}
+			for _, call := range tt.resolveViaNameOrIDSliceCalls {
+				subnetsResolver.EXPECT().ResolveViaNameOrIDSlice(gomock.Any(), gomock.Any(), gomock.Any()).Return(call.subnets, call.err)
 			}
 
 			annotationParser := annotations.NewSuffixAnnotationParser("service.beta.kubernetes.io")

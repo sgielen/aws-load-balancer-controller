@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
+
 	awssdk "github.com/aws/aws-sdk-go/aws"
 	ec2sdk "github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/google/go-cmp/cmp"
@@ -23,7 +25,8 @@ import (
 )
 
 const (
-	resourceIDLoadBalancer = "LoadBalancer"
+	resourceIDLoadBalancer         = "LoadBalancer"
+	minimalAvailableIPAddressCount = int64(8)
 )
 
 func (t *defaultModelBuildTask) buildLoadBalancer(ctx context.Context, listenPortConfigByPort map[int64]listenPortConfig) (*elbv2model.LoadBalancer, error) {
@@ -95,6 +98,10 @@ func (t *defaultModelBuildTask) buildLoadBalancerName(_ context.Context, scheme 
 	}
 	if len(explicitNames) == 1 {
 		name, _ := explicitNames.PopAny()
+		// The name of the loadbalancer can only have up to 32 characters
+		if len(name) > 32 {
+			return "", errors.New("load balancer name cannot be longer than 32 characters")
+		}
 		return name, nil
 	}
 	if len(explicitNames) > 1 {
@@ -189,10 +196,35 @@ func (t *defaultModelBuildTask) buildLoadBalancerSubnetMappings(ctx context.Cont
 		explicitSubnetNameOrIDsList = append(explicitSubnetNameOrIDsList, rawSubnetNameOrIDs)
 	}
 
-	if len(explicitSubnetNameOrIDsList) == 0 {
+	if len(explicitSubnetNameOrIDsList) != 0 {
+		chosenSubnetNameOrIDs := explicitSubnetNameOrIDsList[0]
+		for _, subnetNameOrIDs := range explicitSubnetNameOrIDsList[1:] {
+			// subnetNameOrIDs order doesn't matter
+			if !cmp.Equal(chosenSubnetNameOrIDs, subnetNameOrIDs, equality.IgnoreStringSliceOrder()) {
+				return nil, errors.Errorf("conflicting subnets: %v | %v", chosenSubnetNameOrIDs, subnetNameOrIDs)
+			}
+		}
+		chosenSubnets, err := t.subnetsResolver.ResolveViaNameOrIDSlice(ctx, chosenSubnetNameOrIDs,
+			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeApplication),
+			networking.WithSubnetsResolveLBScheme(scheme),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return buildLoadBalancerSubnetMappingsWithSubnets(chosenSubnets), nil
+	}
+	stackTags := t.trackingProvider.StackTags(t.stack)
+
+	sdkLBs, err := t.elbv2TaggingManager.ListLoadBalancers(ctx, tracking.TagsAsTagFilter(stackTags))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(sdkLBs) == 0 {
 		chosenSubnets, err := t.subnetsResolver.ResolveViaDiscovery(ctx,
 			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeApplication),
 			networking.WithSubnetsResolveLBScheme(scheme),
+			networking.WithSubnetsResolveAvailableIPAddressCount(minimalAvailableIPAddressCount),
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't auto-discover subnets")
@@ -200,24 +232,68 @@ func (t *defaultModelBuildTask) buildLoadBalancerSubnetMappings(ctx context.Cont
 		return buildLoadBalancerSubnetMappingsWithSubnets(chosenSubnets), nil
 	}
 
-	chosenSubnetNameOrIDs := explicitSubnetNameOrIDsList[0]
-	for _, subnetNameOrIDs := range explicitSubnetNameOrIDsList[1:] {
-		// subnetNameOrIDs orders doesn't matter.
-		if !cmp.Equal(chosenSubnetNameOrIDs, subnetNameOrIDs, equality.IgnoreStringSliceOrder()) {
-			return nil, errors.Errorf("conflicting subnets: %v | %v", chosenSubnetNameOrIDs, subnetNameOrIDs)
-		}
+	availabilityZones := sdkLBs[0].LoadBalancer.AvailabilityZones
+	subnetIDs := make([]string, 0, len(availabilityZones))
+	for _, availabilityZone := range availabilityZones {
+		subnetID := awssdk.StringValue(availabilityZone.SubnetId)
+		subnetIDs = append(subnetIDs, subnetID)
 	}
-	chosenSubnets, err := t.subnetsResolver.ResolveViaNameOrIDSlice(ctx, chosenSubnetNameOrIDs,
-		networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeApplication),
-		networking.WithSubnetsResolveLBScheme(scheme),
-	)
-	if err != nil {
-		return nil, err
-	}
-	return buildLoadBalancerSubnetMappingsWithSubnets(chosenSubnets), nil
+	return buildLoadBalancerSubnetMappingsWithSubnetIDs(subnetIDs), nil
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerSecurityGroups(ctx context.Context, listenPortConfigByPort map[int64]listenPortConfig, ipAddressType elbv2model.IPAddressType) ([]core.StringToken, error) {
+	sgNameOrIDsViaAnnotation, err := t.buildFrontendSGNameOrIDsFromAnnotation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var lbSGTokens []core.StringToken
+	if len(sgNameOrIDsViaAnnotation) == 0 {
+		managedSG, err := t.buildManagedSecurityGroup(ctx, listenPortConfigByPort, ipAddressType)
+		if err != nil {
+			return nil, err
+		}
+		lbSGTokens = append(lbSGTokens, managedSG.GroupID())
+		if !t.enableBackendSG {
+			t.backendSGIDToken = managedSG.GroupID()
+		} else {
+			backendSGID, err := t.backendSGProvider.Get(ctx)
+			if err != nil {
+				return nil, err
+			}
+			t.backendSGIDToken = core.LiteralStringToken((backendSGID))
+			lbSGTokens = append(lbSGTokens, t.backendSGIDToken)
+		}
+		t.logger.Info("Auto Create SG", "LB SGs", lbSGTokens, "backend SG", t.backendSGIDToken)
+	} else {
+		manageBackendSGRules, err := t.buildManageSecurityGroupRulesFlag(ctx)
+		if err != nil {
+			return nil, err
+		}
+		frontendSGIDs, err := t.resolveSecurityGroupIDsViaNameOrIDSlice(ctx, sgNameOrIDsViaAnnotation)
+		if err != nil {
+			return nil, err
+		}
+		for _, sgID := range frontendSGIDs {
+			lbSGTokens = append(lbSGTokens, core.LiteralStringToken(sgID))
+		}
+
+		if manageBackendSGRules {
+			if !t.enableBackendSG {
+				return nil, errors.New("backendSG feature is required to manage worker node SG rules when frontendSG manually specified")
+			}
+			backendSGID, err := t.backendSGProvider.Get(ctx)
+			if err != nil {
+				return nil, err
+			}
+			t.backendSGIDToken = core.LiteralStringToken(backendSGID)
+			lbSGTokens = append(lbSGTokens, t.backendSGIDToken)
+		}
+		t.logger.Info("SG configured via annotation", "LB SGs", lbSGTokens, "backend SG", t.backendSGIDToken)
+	}
+	return lbSGTokens, nil
+}
+
+func (t *defaultModelBuildTask) buildFrontendSGNameOrIDsFromAnnotation(ctx context.Context) ([]string, error) {
 	var explicitSGNameOrIDsList [][]string
 	for _, member := range t.ingGroup.Members {
 		var rawSGNameOrIDs []string
@@ -227,29 +303,15 @@ func (t *defaultModelBuildTask) buildLoadBalancerSecurityGroups(ctx context.Cont
 		explicitSGNameOrIDsList = append(explicitSGNameOrIDsList, rawSGNameOrIDs)
 	}
 	if len(explicitSGNameOrIDsList) == 0 {
-		sg, err := t.buildManagedSecurityGroup(ctx, listenPortConfigByPort, ipAddressType)
-		if err != nil {
-			return nil, err
-		}
-		return []core.StringToken{sg.GroupID()}, nil
+		return nil, nil
 	}
-
 	chosenSGNameOrIDs := explicitSGNameOrIDsList[0]
 	for _, sgNameOrIDs := range explicitSGNameOrIDsList[1:] {
-		// securityGroups order might matters in the future(e.g. use the first securityGroup for traffic to nodeGroups)
 		if !cmp.Equal(chosenSGNameOrIDs, sgNameOrIDs) {
 			return nil, errors.Errorf("conflicting securityGroups: %v | %v", chosenSGNameOrIDs, sgNameOrIDs)
 		}
 	}
-	chosenSGIDs, err := t.resolveSecurityGroupIDsViaNameOrIDSlice(ctx, chosenSGNameOrIDs)
-	if err != nil {
-		return nil, err
-	}
-	sgIDTokens := make([]core.StringToken, 0, len(chosenSGIDs))
-	for _, sgID := range chosenSGIDs {
-		sgIDTokens = append(sgIDTokens, core.LiteralStringToken(sgID))
-	}
-	return sgIDTokens, nil
+	return chosenSGNameOrIDs, nil
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerCOIPv4Pool(_ context.Context) (*string, error) {
@@ -278,21 +340,12 @@ func (t *defaultModelBuildTask) buildLoadBalancerCOIPv4Pool(_ context.Context) (
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerAttributes(_ context.Context) ([]elbv2model.LoadBalancerAttribute, error) {
-	mergedAttributes := make(map[string]string)
-	for _, member := range t.ingGroup.Members {
-		var rawAttributes map[string]string
-		if _, err := t.annotationParser.ParseStringMapAnnotation(annotations.IngressSuffixLoadBalancerAttributes, &rawAttributes, member.Ing.Annotations); err != nil {
-			return nil, err
-		}
-		for attrKey, attrValue := range rawAttributes {
-			if existingAttrValue, exists := mergedAttributes[attrKey]; exists && existingAttrValue != attrValue {
-				return nil, errors.Errorf("conflicting loadBalancerAttribute %v: %v | %v", attrKey, existingAttrValue, attrValue)
-			}
-			mergedAttributes[attrKey] = attrValue
-		}
+	ingGroupAttributes, err := t.buildIngressGroupLoadBalancerAttributes(t.ingGroup.Members)
+	if err != nil {
+		return nil, err
 	}
-	attributes := make([]elbv2model.LoadBalancerAttribute, 0, len(mergedAttributes))
-	for attrKey, attrValue := range mergedAttributes {
+	attributes := make([]elbv2model.LoadBalancerAttribute, 0, len(ingGroupAttributes))
+	for attrKey, attrValue := range ingGroupAttributes {
 		attributes = append(attributes, elbv2model.LoadBalancerAttribute{
 			Key:   attrKey,
 			Value: attrValue,
@@ -354,7 +407,7 @@ func (t *defaultModelBuildTask) resolveSecurityGroupIDsViaNameOrIDSlice(ctx cont
 		resolvedSGIDs = append(resolvedSGIDs, awssdk.StringValue(sg.GroupId))
 	}
 	if len(resolvedSGIDs) != len(sgNameOrIDs) {
-		return nil, errors.Errorf("couldn't found all securityGroups, nameOrIDs: %v, found: %v", sgNameOrIDs, resolvedSGIDs)
+		return nil, errors.Errorf("couldn't find all securityGroups, nameOrIDs: %v, found: %v", sgNameOrIDs, resolvedSGIDs)
 	}
 	return resolvedSGIDs, nil
 }
@@ -364,6 +417,16 @@ func buildLoadBalancerSubnetMappingsWithSubnets(subnets []*ec2sdk.Subnet) []elbv
 	for _, subnet := range subnets {
 		subnetMappings = append(subnetMappings, elbv2model.SubnetMapping{
 			SubnetID: awssdk.StringValue(subnet.SubnetId),
+		})
+	}
+	return subnetMappings
+}
+
+func buildLoadBalancerSubnetMappingsWithSubnetIDs(subnetIDs []string) []elbv2model.SubnetMapping {
+	subnetMappings := make([]elbv2model.SubnetMapping, 0, len(subnetIDs))
+	for _, subnetID := range subnetIDs {
+		subnetMappings = append(subnetMappings, elbv2model.SubnetMapping{
+			SubnetID: subnetID,
 		})
 	}
 	return subnetMappings

@@ -40,7 +40,7 @@ func NewServiceReconciler(cloud aws.Cloud, k8sClient client.Client, eventRecorde
 
 	annotationParser := annotations.NewSuffixAnnotationParser(serviceAnnotationPrefix)
 	trackingProvider := tracking.NewDefaultProvider(serviceTagPrefix, config.ClusterName)
-	elbv2TaggingManager := elbv2.NewDefaultTaggingManager(cloud.ELBV2(), logger)
+	elbv2TaggingManager := elbv2.NewDefaultTaggingManager(cloud.ELBV2(), cloud.VpcID(), config.FeatureGate, logger)
 	modelBuilder := service.NewDefaultModelBuilder(annotationParser, subnetsResolver, vpcResolver, trackingProvider,
 		elbv2TaggingManager, config.ClusterName, config.DefaultTags, config.ExternalManagedTags, config.DefaultSSLPolicy)
 	stackMarshaller := deploy.NewDefaultStackMarshaller()
@@ -78,12 +78,11 @@ type serviceReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services/status,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-func (r *serviceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
-	return runtime.HandleReconcileError(r.reconcile(req), r.logger)
+func (r *serviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return runtime.HandleReconcileError(r.reconcile(ctx, req), r.logger)
 }
 
-func (r *serviceReconciler) reconcile(req ctrl.Request) error {
-	ctx := context.Background()
+func (r *serviceReconciler) reconcile(ctx context.Context, req ctrl.Request) error {
 	svc := &corev1.Service{}
 	if err := r.k8sClient.Get(ctx, req.NamespacedName, svc); err != nil {
 		return client.IgnoreNotFound(err)

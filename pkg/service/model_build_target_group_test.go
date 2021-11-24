@@ -3,6 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"sort"
+	"strconv"
+	"testing"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/stretchr/testify/assert"
@@ -12,9 +16,6 @@ import (
 	elbv2api "sigs.k8s.io/aws-load-balancer-controller/apis/elbv2/v1beta1"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/annotations"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
-	"sort"
-	"strconv"
-	"testing"
 )
 
 func Test_defaultModelBuilderTask_targetGroupAttrs(t *testing.T) {
@@ -624,26 +625,6 @@ func Test_defaultModelBuilderTask_buildTargetGroupBindingNetworking(t *testing.T
 							},
 						},
 					},
-					{
-						From: []elbv2.NetworkingPeer{
-							{
-								IPBlock: &elbv2api.IPBlock{
-									CIDR: "172.16.0.0/19",
-								},
-							},
-							{
-								IPBlock: &elbv2api.IPBlock{
-									CIDR: "1.2.3.4/19",
-								},
-							},
-						},
-						Ports: []elbv2api.NetworkingPort{
-							{
-								Protocol: &networkingProtocolTCP,
-								Port:     &port80,
-							},
-						},
-					},
 				},
 			},
 		},
@@ -837,6 +818,57 @@ func Test_defaultModelBuilderTask_buildTargetGroupBindingNetworking(t *testing.T
 				},
 			},
 		},
+		{
+			name: "tcp-service with preserve Client IP, hc is traffic port, source range specified and contains 0/0",
+			svc: &corev1.Service{
+				Spec: corev1.ServiceSpec{
+					LoadBalancerSourceRanges: []string{"10.0.0.0/16", "1.2.3.4/24", "0.0.0.0/0"},
+				},
+			},
+			tgPort: port80,
+			hcPort: port80,
+			subnets: []*ec2.Subnet{
+				{
+					CidrBlock: aws.String("172.16.0.0/19"),
+					SubnetId:  aws.String("sn-1"),
+				},
+				{
+					CidrBlock: aws.String("1.2.3.4/19"),
+					SubnetId:  aws.String("sn-2"),
+				},
+			},
+			tgProtocol:       corev1.ProtocolTCP,
+			preserveClientIP: true,
+			want: &elbv2.TargetGroupBindingNetworking{
+				Ingress: []elbv2.NetworkingIngressRule{
+					{
+						From: []elbv2.NetworkingPeer{
+							{
+								IPBlock: &elbv2api.IPBlock{
+									CIDR: "10.0.0.0/16",
+								},
+							},
+							{
+								IPBlock: &elbv2api.IPBlock{
+									CIDR: "1.2.3.4/24",
+								},
+							},
+							{
+								IPBlock: &elbv2api.IPBlock{
+									CIDR: "0.0.0.0/0",
+								},
+							},
+						},
+						Ports: []elbv2api.NetworkingPort{
+							{
+								Protocol: &networkingProtocolTCP,
+								Port:     &port80,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1012,6 +1044,21 @@ func Test_defaultModelBuilder_buildTargetType(t *testing.T) {
 				},
 			},
 			wantErr: errors.New("unsupported target type \"unknown\" for load balancer type \"external\""),
+		},
+		{
+			testName: "external, ClusterIP with target type instance",
+			svc: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
+						"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "instance",
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeClusterIP,
+				},
+			},
+			wantErr: errors.New("unsupported service type \"ClusterIP\" for load balancer target type \"instance\""),
 		},
 	}
 	for _, tt := range tests {

@@ -17,7 +17,8 @@ limitations under the License.
 package main
 
 import (
-	"context"
+	"os"
+
 	"github.com/go-logr/logr"
 	"github.com/spf13/pflag"
 	zapraw "go.uber.org/zap"
@@ -25,7 +26,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
-	"os"
 	elbv2api "sigs.k8s.io/aws-load-balancer-controller/apis/elbv2/v1beta1"
 	elbv2controller "sigs.k8s.io/aws-load-balancer-controller/controllers/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/controllers/ingress"
@@ -91,33 +91,37 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+	config.ConfigureWebhookServerCert(controllerCFG.RuntimeConfig, mgr)
 	clientSet, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		setupLog.Error(err, "unable to obtain clientSet")
 		os.Exit(1)
 	}
+
 	podInfoRepo := k8s.NewDefaultPodInfoRepo(clientSet.CoreV1().RESTClient(), rtOpts.Namespace, ctrl.Log)
 	finalizerManager := k8s.NewDefaultFinalizerManager(mgr.GetClient(), ctrl.Log)
-	podENIResolver := networking.NewDefaultPodENIInfoResolver(cloud.EC2(), cloud.VpcID(), ctrl.Log)
-	nodeENIResolver := networking.NewDefaultNodeENIInfoResolver(cloud.EC2(), ctrl.Log)
 	sgManager := networking.NewDefaultSecurityGroupManager(cloud.EC2(), ctrl.Log)
 	sgReconciler := networking.NewDefaultSecurityGroupReconciler(sgManager, ctrl.Log)
 	azInfoProvider := networking.NewDefaultAZInfoProvider(cloud.EC2(), ctrl.Log.WithName("az-info-provider"))
+	vpcInfoProvider := networking.NewDefaultVPCInfoProvider(cloud.EC2(), ctrl.Log.WithName("vpc-info-provider"))
 	subnetResolver := networking.NewDefaultSubnetsResolver(azInfoProvider, cloud.EC2(), cloud.VpcID(), controllerCFG.ClusterName, ctrl.Log.WithName("subnets-resolver"))
 	vpcResolver := networking.NewDefaultVPCResolver(cloud.EC2(), cloud.VpcID(), ctrl.Log.WithName("vpc-resolver"))
-	tgbResManager := targetgroupbinding.NewDefaultResourceManager(mgr.GetClient(), cloud.ELBV2(),
-		podInfoRepo, podENIResolver, nodeENIResolver, sgManager, sgReconciler, cloud.VpcID(), controllerCFG.ClusterName, mgr.GetEventRecorderFor("targetGroupBinding"), ctrl.Log)
+	tgbResManager := targetgroupbinding.NewDefaultResourceManager(mgr.GetClient(), cloud.ELBV2(), cloud.EC2(),
+		podInfoRepo, sgManager, sgReconciler, cloud.VpcID(), controllerCFG.ClusterName, mgr.GetEventRecorderFor("targetGroupBinding"), ctrl.Log, controllerCFG.EnableEndpointSlices, controllerCFG.DisableRestrictedSGRules, vpcInfoProvider)
+	backendSGProvider := networking.NewBackendSGProvider(controllerCFG.ClusterName, controllerCFG.BackendSecurityGroup,
+		cloud.VpcID(), cloud.EC2(), mgr.GetClient(), ctrl.Log.WithName("backend-sg-provider"))
 	ingGroupReconciler := ingress.NewGroupReconciler(cloud, mgr.GetClient(), mgr.GetEventRecorderFor("ingress"),
 		finalizerManager, sgManager, sgReconciler, subnetResolver,
-		controllerCFG, ctrl.Log.WithName("controllers").WithName("ingress"))
+		controllerCFG, backendSGProvider, ctrl.Log.WithName("controllers").WithName("ingress"))
 	svcReconciler := service.NewServiceReconciler(cloud, mgr.GetClient(), mgr.GetEventRecorderFor("service"),
 		finalizerManager, sgManager, sgReconciler, subnetResolver, vpcResolver,
 		controllerCFG, ctrl.Log.WithName("controllers").WithName("service"))
 	tgbReconciler := elbv2controller.NewTargetGroupBindingReconciler(mgr.GetClient(), mgr.GetEventRecorderFor("targetGroupBinding"),
 		finalizerManager, tgbResManager,
 		controllerCFG, ctrl.Log.WithName("controllers").WithName("targetGroupBinding"))
-	ctx := context.Background()
-	if err = ingGroupReconciler.SetupWithManager(ctx, mgr); err != nil {
+
+	ctx := ctrl.SetupSignalHandler()
+	if err = ingGroupReconciler.SetupWithManager(ctx, mgr, clientSet); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
 		os.Exit(1)
 	}
@@ -142,23 +146,22 @@ func main() {
 		mgr.GetClient(), ctrl.Log.WithName("pod-readiness-gate-injector"))
 	corewebhook.NewPodMutator(podReadinessGateInjector).SetupWithManager(mgr)
 	elbv2webhook.NewTargetGroupBindingMutator(cloud.ELBV2(), ctrl.Log).SetupWithManager(mgr)
-	elbv2webhook.NewTargetGroupBindingValidator(ctrl.Log).SetupWithManager(mgr)
+	elbv2webhook.NewTargetGroupBindingValidator(mgr.GetClient(), cloud.ELBV2(), ctrl.Log).SetupWithManager(mgr)
 	networkingwebhook.NewIngressValidator(mgr.GetClient(), controllerCFG.IngressConfig, ctrl.Log).SetupWithManager(mgr)
 	//+kubebuilder:scaffold:builder
 
-	stopChan := ctrl.SetupSignalHandler()
 	go func() {
 		setupLog.Info("starting podInfo repo")
-		if err := podInfoRepo.Start(stopChan); err != nil {
+		if err := podInfoRepo.Start(ctx); err != nil {
 			setupLog.Error(err, "problem running podInfo repo")
 			os.Exit(1)
 		}
 	}()
-	if err := podInfoRepo.WaitForCacheSync(stopChan); err != nil {
+	if err := podInfoRepo.WaitForCacheSync(ctx); err != nil {
 		setupLog.Error(err, "problem wait for podInfo repo sync")
 		os.Exit(1)
 	}
-	if err := mgr.Start(stopChan); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
@@ -168,7 +171,10 @@ func main() {
 func loadControllerConfig() (config.ControllerConfig, error) {
 	defaultAWSThrottleCFG := throttle.NewDefaultServiceOperationsThrottleConfig()
 	controllerCFG := config.ControllerConfig{
-		AWSConfig: aws.CloudConfig{ThrottleConfig: defaultAWSThrottleCFG},
+		AWSConfig: aws.CloudConfig{
+			ThrottleConfig: defaultAWSThrottleCFG,
+		},
+		FeatureGate: config.NewFeatureGate(),
 	}
 
 	fs := pflag.NewFlagSet("", pflag.ExitOnError)

@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"net"
 	"regexp"
-	"sigs.k8s.io/aws-load-balancer-controller/pkg/algorithm"
+	"sort"
 	"strconv"
+
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/algorithm"
+	elbv2deploy "sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -24,8 +27,8 @@ const (
 	lbAttrsAccessLogsS3Bucket            = "access_logs.s3.bucket"
 	lbAttrsAccessLogsS3Prefix            = "access_logs.s3.prefix"
 	lbAttrsLoadBalancingCrossZoneEnabled = "load_balancing.cross_zone.enabled"
-
-	resourceIDLoadBalancer = "LoadBalancer"
+	resourceIDLoadBalancer               = "LoadBalancer"
+	minimalAvailableIPAddressCount       = int64(8)
 )
 
 func (t *defaultModelBuildTask) buildLoadBalancer(ctx context.Context, scheme elbv2model.LoadBalancerScheme) error {
@@ -54,7 +57,10 @@ func (t *defaultModelBuildTask) buildLoadBalancerSpec(ctx context.Context, schem
 	if err != nil {
 		return elbv2model.LoadBalancerSpec{}, err
 	}
-	name := t.buildLoadBalancerName(ctx, scheme)
+	name, err := t.buildLoadBalancerName(ctx, scheme)
+	if err != nil {
+		return elbv2model.LoadBalancerSpec{}, err
+	}
 	spec := elbv2model.LoadBalancerSpec{
 		Name:                   name,
 		Type:                   elbv2model.LoadBalancerTypeNetwork,
@@ -83,7 +89,32 @@ func (t *defaultModelBuildTask) buildLoadBalancerIPAddressType(_ context.Context
 	}
 }
 
-func (t *defaultModelBuildTask) buildLoadBalancerScheme(ctx context.Context) (elbv2model.LoadBalancerScheme, bool, error) {
+func (t *defaultModelBuildTask) buildLoadBalancerScheme(ctx context.Context) (elbv2model.LoadBalancerScheme, error) {
+	scheme, explicitSchemeSpecified, err := t.buildLoadBalancerSchemeViaAnnotation(ctx)
+	if err != nil {
+		return elbv2model.LoadBalancerSchemeInternal, err
+	}
+	if explicitSchemeSpecified {
+		return scheme, nil
+	}
+	existingLB, err := t.fetchExistingLoadBalancer(ctx)
+	if err != nil {
+		return elbv2model.LoadBalancerSchemeInternal, err
+	}
+	if existingLB != nil {
+		switch aws.StringValue(existingLB.LoadBalancer.Scheme) {
+		case string(elbv2model.LoadBalancerSchemeInternal):
+			return elbv2model.LoadBalancerSchemeInternal, nil
+		case string(elbv2model.LoadBalancerSchemeInternetFacing):
+			return elbv2model.LoadBalancerSchemeInternetFacing, nil
+		default:
+			return "", errors.New("invalid load balancer scheme")
+		}
+	}
+	return elbv2model.LoadBalancerSchemeInternal, nil
+}
+
+func (t *defaultModelBuildTask) buildLoadBalancerSchemeViaAnnotation(ctx context.Context) (elbv2model.LoadBalancerScheme, bool, error) {
 	rawScheme := ""
 	if exists := t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixScheme, &rawScheme, t.service.Annotations); exists {
 		switch rawScheme {
@@ -115,23 +146,21 @@ func (t *defaultModelBuildTask) buildLoadBalancerSchemeLegacyAnnotation(_ contex
 	return elbv2model.LoadBalancerSchemeInternal, false, nil
 }
 
-func (t *defaultModelBuildTask) getExistingLoadBalancerScheme(ctx context.Context) (elbv2model.LoadBalancerScheme, error) {
-	stackTags := t.trackingProvider.StackTags(t.stack)
-	sdkLBs, err := t.elbv2TaggingManager.ListLoadBalancers(ctx, tracking.TagsAsTagFilter(stackTags))
-	if err != nil {
-		return "", err
-	}
-	if len(sdkLBs) == 0 {
-		return elbv2model.LoadBalancerSchemeInternal, nil
-	}
-	switch aws.StringValue(sdkLBs[0].LoadBalancer.Scheme) {
-	case string(elbv2model.LoadBalancerSchemeInternal):
-		return elbv2model.LoadBalancerSchemeInternal, nil
-	case string(elbv2model.LoadBalancerSchemeInternetFacing):
-		return elbv2model.LoadBalancerSchemeInternetFacing, nil
-	default:
-		return "", errors.New("invalid load balancer scheme")
-	}
+func (t *defaultModelBuildTask) fetchExistingLoadBalancer(ctx context.Context) (*elbv2deploy.LoadBalancerWithTags, error) {
+	var fetchError error
+	t.fetchExistingLoadBalancerOnce.Do(func() {
+		stackTags := t.trackingProvider.StackTags(t.stack)
+		sdkLBs, err := t.elbv2TaggingManager.ListLoadBalancers(ctx, tracking.TagsAsTagFilter(stackTags))
+		if err != nil {
+			fetchError = err
+		}
+		if len(sdkLBs) == 0 {
+			t.existingLoadBalancer = nil
+		} else {
+			t.existingLoadBalancer = &sdkLBs[0]
+		}
+	})
+	return t.existingLoadBalancer, fetchError
 }
 
 func (t *defaultModelBuildTask) buildAdditionalResourceTags(_ context.Context) (map[string]string, error) {
@@ -217,12 +246,42 @@ func (t *defaultModelBuildTask) getMatchingIPforSubnet(_ context.Context, subnet
 	return "", errors.Errorf("no matching ip for subnet %s", *subnet.SubnetId)
 }
 
-func (t *defaultModelBuildTask) resolveLoadBalancerSubnets(ctx context.Context, scheme elbv2model.LoadBalancerScheme) ([]*ec2.Subnet, error) {
+func (t *defaultModelBuildTask) buildLoadBalancerSubnets(ctx context.Context, scheme elbv2model.LoadBalancerScheme) ([]*ec2.Subnet, error) {
 	var rawSubnetNameOrIDs []string
 	if exists := t.annotationParser.ParseStringSliceAnnotation(annotations.SvcLBSuffixSubnets, &rawSubnetNameOrIDs, t.service.Annotations); exists {
 		return t.subnetsResolver.ResolveViaNameOrIDSlice(ctx, rawSubnetNameOrIDs,
 			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeNetwork),
 			networking.WithSubnetsResolveLBScheme(scheme),
+		)
+	}
+
+	existingLB, err := t.fetchExistingLoadBalancer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if existingLB != nil {
+		availabilityZones := existingLB.LoadBalancer.AvailabilityZones
+		subnetIDs := make([]string, 0, len(availabilityZones))
+		for _, availabilityZone := range availabilityZones {
+			subnetID := aws.StringValue(availabilityZone.SubnetId)
+			subnetIDs = append(subnetIDs, subnetID)
+		}
+		return t.subnetsResolver.ResolveViaNameOrIDSlice(ctx, subnetIDs,
+			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeNetwork),
+			networking.WithSubnetsResolveLBScheme(scheme),
+		)
+	}
+
+	// for internet-facing Load Balancers, the subnets mush have at least 8 available IP addresses;
+	// for internal Load Balancers, this is only required if private ip address is not assigned
+	var privateIpv4Addresses []string
+	ipv4Configured := t.annotationParser.ParseStringSliceAnnotation(annotations.SvcLBSuffixPrivateIpv4Addresses, &privateIpv4Addresses, t.service.Annotations)
+	if (scheme == elbv2model.LoadBalancerSchemeInternetFacing) ||
+		((scheme == elbv2model.LoadBalancerSchemeInternal) && !ipv4Configured) {
+		return t.subnetsResolver.ResolveViaDiscovery(ctx,
+			networking.WithSubnetsResolveLBType(elbv2model.LoadBalancerTypeNetwork),
+			networking.WithSubnetsResolveLBScheme(scheme),
+			networking.WithSubnetsResolveAvailableIPAddressCount(minimalAvailableIPAddressCount),
 		)
 	}
 	return t.subnetsResolver.ResolveViaDiscovery(ctx,
@@ -232,50 +291,80 @@ func (t *defaultModelBuildTask) resolveLoadBalancerSubnets(ctx context.Context, 
 }
 
 func (t *defaultModelBuildTask) buildLoadBalancerAttributes(_ context.Context) ([]elbv2model.LoadBalancerAttribute, error) {
-	var attrs []elbv2model.LoadBalancerAttribute
-	accessLogEnabled := t.defaultAccessLogS3Enabled
-	bucketName := t.defaultAccessLogsS3Bucket
-	bucketPrefix := t.defaultAccessLogsS3Prefix
-	if _, err := t.annotationParser.ParseBoolAnnotation(annotations.SvcLBSuffixAccessLogEnabled, &accessLogEnabled, t.service.Annotations); err != nil {
+	loadBalancerAttributes, err := t.getLoadBalancerAttributes()
+	if err != nil {
 		return []elbv2model.LoadBalancerAttribute{}, err
 	}
-	if accessLogEnabled {
-		t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixAccessLogS3BucketName, &bucketName, t.service.Annotations)
-		t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixAccessLogS3BucketPrefix, &bucketPrefix, t.service.Annotations)
-	}
-	crossZoneEnabled := t.defaultLoadBalancingCrossZoneEnabled
-	if _, err := t.annotationParser.ParseBoolAnnotation(annotations.SvcLBSuffixCrossZoneLoadBalancingEnabled, &crossZoneEnabled, t.service.Annotations); err != nil {
+	specificAttributes, err := t.getAnnotationSpecificLbAttributes()
+	if err != nil {
 		return []elbv2model.LoadBalancerAttribute{}, err
 	}
+	mergedAttributes := algorithm.MergeStringMap(specificAttributes, loadBalancerAttributes)
+	return makeAttributesSliceFromMap(mergedAttributes), nil
+}
 
-	attrs = []elbv2model.LoadBalancerAttribute{
-		{
-			Key:   lbAttrsAccessLogsS3Enabled,
-			Value: strconv.FormatBool(accessLogEnabled),
-		},
-		{
-			Key:   lbAttrsAccessLogsS3Bucket,
-			Value: bucketName,
-		},
-		{
-			Key:   lbAttrsAccessLogsS3Prefix,
-			Value: bucketPrefix,
-		},
-		{
-			Key:   lbAttrsLoadBalancingCrossZoneEnabled,
-			Value: strconv.FormatBool(crossZoneEnabled),
-		},
+func makeAttributesSliceFromMap(loadBalancerAttributesMap map[string]string) []elbv2model.LoadBalancerAttribute {
+	attributes := make([]elbv2model.LoadBalancerAttribute, 0, len(loadBalancerAttributesMap))
+	for attrKey, attrValue := range loadBalancerAttributesMap {
+		attributes = append(attributes, elbv2model.LoadBalancerAttribute{
+			Key:   attrKey,
+			Value: attrValue,
+		})
 	}
+	sort.Slice(attributes, func(i, j int) bool {
+		return attributes[i].Key < attributes[j].Key
+	})
+	return attributes
+}
 
-	return attrs, nil
+func (t *defaultModelBuildTask) getLoadBalancerAttributes() (map[string]string, error) {
+	var attributes map[string]string
+	if _, err := t.annotationParser.ParseStringMapAnnotation(annotations.SvcLBSuffixLoadBalancerAttributes, &attributes, t.service.Annotations); err != nil {
+		return nil, err
+	}
+	return attributes, nil
+}
+
+func (t *defaultModelBuildTask) getAnnotationSpecificLbAttributes() (map[string]string, error) {
+	var accessLogEnabled bool
+	var bucketName string
+	var bucketPrefix string
+	var crossZoneEnabled bool
+	annotationSpecificAttrs := make(map[string]string)
+
+	exists, err := t.annotationParser.ParseBoolAnnotation(annotations.SvcLBSuffixAccessLogEnabled, &accessLogEnabled, t.service.Annotations)
+	if err != nil {
+		return nil, err
+	}
+	if exists && accessLogEnabled {
+		annotationSpecificAttrs[lbAttrsAccessLogsS3Enabled] = strconv.FormatBool(accessLogEnabled)
+		if exists := t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixAccessLogS3BucketName, &bucketName, t.service.Annotations); exists {
+			annotationSpecificAttrs[lbAttrsAccessLogsS3Bucket] = bucketName
+		}
+		if exists := t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixAccessLogS3BucketPrefix, &bucketPrefix, t.service.Annotations); exists {
+			annotationSpecificAttrs[lbAttrsAccessLogsS3Prefix] = bucketPrefix
+		}
+	}
+	exists, err = t.annotationParser.ParseBoolAnnotation(annotations.SvcLBSuffixCrossZoneLoadBalancingEnabled, &crossZoneEnabled, t.service.Annotations)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		annotationSpecificAttrs[lbAttrsLoadBalancingCrossZoneEnabled] = strconv.FormatBool(crossZoneEnabled)
+	}
+	return annotationSpecificAttrs, nil
 }
 
 var invalidLoadBalancerNamePattern = regexp.MustCompile("[[:^alnum:]]")
 
-func (t *defaultModelBuildTask) buildLoadBalancerName(_ context.Context, scheme elbv2model.LoadBalancerScheme) string {
+func (t *defaultModelBuildTask) buildLoadBalancerName(_ context.Context, scheme elbv2model.LoadBalancerScheme) (string, error) {
 	var name string
 	if exists := t.annotationParser.ParseStringAnnotation(annotations.SvcLBSuffixLoadBalancerName, &name, t.service.Annotations); exists {
-		return name
+		// The name of the loadbalancer can only have up to 32 characters
+		if len(name) > 32 {
+			return "", errors.New("load balancer name cannot be longer than 32 characters")
+		}
+		return name, nil
 	}
 	uuidHash := sha256.New()
 	_, _ = uuidHash.Write([]byte(t.clusterName))
@@ -285,5 +374,5 @@ func (t *defaultModelBuildTask) buildLoadBalancerName(_ context.Context, scheme 
 
 	sanitizedNamespace := invalidLoadBalancerNamePattern.ReplaceAllString(t.service.Namespace, "")
 	sanitizedName := invalidLoadBalancerNamePattern.ReplaceAllString(t.service.Name, "")
-	return fmt.Sprintf("k8s-%.8s-%.8s-%.10s", sanitizedNamespace, sanitizedName, uuid)
+	return fmt.Sprintf("k8s-%.8s-%.8s-%.10s", sanitizedNamespace, sanitizedName, uuid), nil
 }

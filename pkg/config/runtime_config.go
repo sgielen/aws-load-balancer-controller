@@ -6,6 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"time"
 )
@@ -20,6 +21,9 @@ const (
 	flagWatchNamespace          = "watch-namespace"
 	flagSyncPeriod              = "sync-period"
 	flagKubeconfig              = "kubeconfig"
+	flagWebhookCertDir          = "webhook-cert-dir"
+	flagWebhookCertName         = "webhook-cert-file"
+	flagWebhookKeyName          = "webhook-key-file"
 
 	defaultKubeconfig              = ""
 	defaultLeaderElectionID        = "aws-load-balancer-controller-leader"
@@ -34,7 +38,10 @@ const (
 	defaultQPS = 1e6
 	// High enough Burst to fit all expected use cases. Burst=0 is not set here, because
 	// client code is overriding it.
-	defaultBurst = 1e6
+	defaultBurst           = 1e6
+	defaultWebhookCertDir  = ""
+	defaultWebhookCertName = ""
+	defaultWebhookKeyName  = ""
 )
 
 // RuntimeConfig stores the configuration for the controller-runtime
@@ -49,6 +56,9 @@ type RuntimeConfig struct {
 	LeaderElectionNamespace string
 	WatchNamespace          string
 	SyncPeriod              time.Duration
+	WebhookCertDir          string
+	WebhookCertName         string
+	WebhookKeyName          string
 }
 
 // BindFlags binds the command line flags to the fields in the config object
@@ -72,6 +82,10 @@ func (c *RuntimeConfig) BindFlags(fs *pflag.FlagSet) {
 		"Namespace the controller watches for updates to Kubernetes objects, If empty, all namespaces are watched.")
 	fs.DurationVar(&c.SyncPeriod, flagSyncPeriod, defaultSyncPeriod,
 		"Period at which the controller forces the repopulation of its local object stores.")
+	fs.StringVar(&c.WebhookCertDir, flagWebhookCertDir, defaultWebhookCertDir, "WebhookCertDir is the directory that contains the webhook server key and certificate.")
+	fs.StringVar(&c.WebhookCertName, flagWebhookCertName, defaultWebhookCertName, "WebhookCertName is the webhook server certificate name.")
+	fs.StringVar(&c.WebhookKeyName, flagWebhookKeyName, defaultWebhookKeyName, "WebhookKeyName is the webhook server key name.")
+
 }
 
 // BuildRestConfig builds the REST config for the controller runtime
@@ -96,14 +110,22 @@ func BuildRestConfig(rtCfg RuntimeConfig) (*rest.Config, error) {
 // BuildRuntimeOptions builds the options for the controller runtime based on config
 func BuildRuntimeOptions(rtCfg RuntimeConfig, scheme *runtime.Scheme) ctrl.Options {
 	return ctrl.Options{
-		Scheme:                  scheme,
-		Port:                    rtCfg.WebhookBindPort,
-		MetricsBindAddress:      rtCfg.MetricsBindAddress,
-		HealthProbeBindAddress:  rtCfg.HealthProbeBindAddress,
-		LeaderElection:          rtCfg.EnableLeaderElection,
-		LeaderElectionID:        rtCfg.LeaderElectionID,
-		LeaderElectionNamespace: rtCfg.LeaderElectionNamespace,
-		Namespace:               rtCfg.WatchNamespace,
-		SyncPeriod:              &rtCfg.SyncPeriod,
+		Scheme:                     scheme,
+		Port:                       rtCfg.WebhookBindPort,
+		CertDir:                    rtCfg.WebhookCertDir,
+		MetricsBindAddress:         rtCfg.MetricsBindAddress,
+		HealthProbeBindAddress:     rtCfg.HealthProbeBindAddress,
+		LeaderElection:             rtCfg.EnableLeaderElection,
+		LeaderElectionResourceLock: resourcelock.ConfigMapsResourceLock,
+		LeaderElectionID:           rtCfg.LeaderElectionID,
+		LeaderElectionNamespace:    rtCfg.LeaderElectionNamespace,
+		Namespace:                  rtCfg.WatchNamespace,
+		SyncPeriod:                 &rtCfg.SyncPeriod,
 	}
+}
+
+// ConfigureWebhookServerCert set up the server cert for the webhook server.
+func ConfigureWebhookServerCert(rtCfg RuntimeConfig, mgr ctrl.Manager) {
+	mgr.GetWebhookServer().CertName = rtCfg.WebhookCertName
+	mgr.GetWebhookServer().KeyName = rtCfg.WebhookKeyName
 }

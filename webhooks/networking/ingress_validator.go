@@ -2,6 +2,7 @@ package networking
 
 import (
 	"context"
+	awssdk "github.com/aws/aws-sdk-go/aws"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	networking "k8s.io/api/networking/v1beta1"
@@ -54,7 +55,7 @@ func (v *ingressValidator) ValidateCreate(ctx context.Context, obj runtime.Objec
 	if err := v.checkGroupNameAnnotationUsage(ing, nil); err != nil {
 		return err
 	}
-	if err := v.checkIngressClassUsage(ctx, ing); err != nil {
+	if err := v.checkIngressClassUsage(ctx, ing, nil); err != nil {
 		return err
 	}
 	return nil
@@ -69,7 +70,7 @@ func (v *ingressValidator) ValidateUpdate(ctx context.Context, obj runtime.Objec
 	if err := v.checkGroupNameAnnotationUsage(ing, oldIng); err != nil {
 		return err
 	}
-	if err := v.checkIngressClassUsage(ctx, ing); err != nil {
+	if err := v.checkIngressClassUsage(ctx, ing, oldIng); err != nil {
 		return err
 	}
 	return nil
@@ -125,26 +126,44 @@ func (v *ingressValidator) checkGroupNameAnnotationUsage(ing *networking.Ingress
 			usedInOldIng = true
 		}
 	}
-	if !usedInOldIng && usedInNewIng {
-		return errors.Errorf("new usage of `%s/%s` annotation is forbidden", annotations.AnnotationPrefixIngress, annotations.IngressSuffixGroupName)
-	}
-	if usedInOldIng && usedInNewIng && (oldGroupName != newGroupName) {
-		return errors.Errorf("new value of `%s/%s` annotation is forbidden", annotations.AnnotationPrefixIngress, annotations.IngressSuffixGroupName)
-	}
-	return nil
-}
 
-func (v *ingressValidator) checkIngressClassUsage(ctx context.Context, ing *networking.Ingress) error {
-	if ing.Spec.IngressClassName != nil {
-		_, err := v.classLoader.Load(ctx, ing)
-		if err != nil {
-			return err
+	if usedInNewIng {
+		if !usedInOldIng || (newGroupName != oldGroupName) {
+			return errors.Errorf("new usage of `%s/%s` annotation is forbidden", annotations.AnnotationPrefixIngress, annotations.IngressSuffixGroupName)
 		}
 	}
 	return nil
 }
 
-// +kubebuilder:webhook:path=/validate-networking-v1beta1-ingress,mutating=false,failurePolicy=fail,groups=networking.k8s.io,resources=ingresses,verbs=create;update,versions=v1beta1,name=vingress.elbv2.k8s.aws,sideEffects=None,webhookVersions=v1beta1,matchPolicy=Equivalent
+// checkIngressClassUsage checks the usage of "ingressClassName" field.
+// if ingressClassName is mutated, it must refer to a existing & valid IngressClass.
+func (v *ingressValidator) checkIngressClassUsage(ctx context.Context, ing *networking.Ingress, oldIng *networking.Ingress) error {
+	usedInNewIng := false
+	usedInOldIng := false
+	newIngressClassName := ""
+	oldIngressClassName := ""
+
+	if ing.Spec.IngressClassName != nil {
+		usedInNewIng = true
+		newIngressClassName = awssdk.StringValue(ing.Spec.IngressClassName)
+	}
+	if oldIng != nil && oldIng.Spec.IngressClassName != nil {
+		usedInOldIng = true
+		oldIngressClassName = awssdk.StringValue(oldIng.Spec.IngressClassName)
+	}
+
+	if usedInNewIng {
+		if !usedInOldIng || (newIngressClassName != oldIngressClassName) {
+			_, err := v.classLoader.Load(ctx, ing)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// +kubebuilder:webhook:path=/validate-networking-v1beta1-ingress,mutating=false,failurePolicy=fail,groups=networking.k8s.io,resources=ingresses,verbs=create;update,versions=v1beta1,name=vingress.elbv2.k8s.aws,sideEffects=None,matchPolicy=Equivalent,webhookVersions=v1,admissionReviewVersions=v1beta1
 
 func (v *ingressValidator) SetupWithManager(mgr ctrl.Manager) {
 	mgr.GetWebhookServer().Register(apiPathValidateNetworkingIngress, webhook.ValidatingWebhookForValidator(v))

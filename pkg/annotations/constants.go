@@ -45,6 +45,7 @@ const (
 	IngressSuffixAuthSessionCookie            = "auth-session-cookie"
 	IngressSuffixAuthSessionTimeout           = "auth-session-timeout"
 	IngressSuffixTargetNodeLabels             = "target-node-labels"
+	IngressSuffixManageSecurityGroupRules     = "manage-backend-security-group-rules"
 
 	// NLB annotation suffixes
 	// prefixes service.beta.kubernetes.io, service.kubernetes.io
@@ -78,4 +79,5 @@ const (
 	SvcLBSuffixSubnets                       = "aws-load-balancer-subnets"
 	SvcLBSuffixALPNPolicy                    = "aws-load-balancer-alpn-policy"
 	SvcLBSuffixTargetNodeLabels              = "aws-load-balancer-target-node-labels"
+	SvcLBSuffixLoadBalancerAttributes        = "aws-load-balancer-attributes"
 )
